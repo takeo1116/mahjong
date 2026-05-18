@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Editable install / virtualenv
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.*
+*.env.local
+
+# Training artifacts / model files / shards
+# (実験成果物は mahjong-experiments/ に置く方針なので本 repo には commit しない)
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.bin
+runs/
+outputs/
+logs/
+*.log
+
+# Temp
+*.tmp
+tmp/
