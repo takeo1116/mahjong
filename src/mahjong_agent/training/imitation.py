@@ -80,6 +80,18 @@ class ImitationConfig:
     device: str = "cpu"
     shuffle: bool = True
     seed: int | None = None
+    # tie-aware imitation
+    tie_aware_discard: bool = False
+    """discard loss の target を ``teacher_best_mask`` (multi-hot) で扱う。
+
+    True のとき:
+      - sample.teacher_best_mask が非ゼロの discard sample は
+        ``-log(sum_{i in mask} softmax(logits)[i])`` で soft target CE。
+      - mask が全 0 の sample は hard top1 CE (= ``selected_discard_tile_type``
+        を target) に fallback。
+    False (default) のとき:
+      - 全 discard sample で hard top1 CE。Stage03 v1 互換。
+    """
 
 
 @dataclass(frozen=True)
@@ -236,6 +248,7 @@ def compute_imitation_loss(
     terminal_class = _move_tensor(batch.terminal_class, device).long()
     yaku_target = _move_tensor(batch.yaku_target, device).float()
     yaku_loss_mask = _move_tensor(batch.yaku_loss_mask, device).float()
+    teacher_best_mask = _move_tensor(batch.teacher_best_mask, device).float()
 
     # forward (4 heads)
     fwd = model(obs, discard_mask=discard_mask)
@@ -257,11 +270,61 @@ def compute_imitation_loss(
     if discard_count > 0:
         d_logits = fwd.discard_logits[discard_valid_idx]
         d_targets = sel_disc[discard_valid_idx]
-        discard_loss = F.cross_entropy(d_logits, d_targets, reduction="mean")
-        with torch.no_grad():
-            discard_correct = int(
-                (d_logits.argmax(dim=-1) == d_targets).sum().item()
+        if config.tie_aware_discard:
+            d_masks = teacher_best_mask[discard_valid_idx]  # (M, 34)
+            has_best = d_masks.sum(dim=-1) > 0  # (M,) bool
+            # mask の中で hot な index を target に使うため、softmax 後の
+            # 確率を合計して -log を取る。
+            log_softmax = F.log_softmax(d_logits, dim=-1)  # (M, 34)
+            losses = torch.zeros(
+                d_logits.size(0), device=d_logits.device, dtype=d_logits.dtype
             )
+            # mask あり: tie-aware soft target
+            if bool(has_best.any().item()):
+                # log_sum_exp over hot indices = log(sum p_i)
+                #   = log( sum exp(log_softmax) where mask=1 )
+                # mask=0 の位置を -inf に倒して logsumexp する。
+                logp = log_softmax[has_best]
+                m = d_masks[has_best]
+                # 0 の位置を -inf 相当に
+                neg_inf = torch.full_like(logp, -1.0e9)
+                masked_logp = torch.where(m > 0, logp, neg_inf)
+                tie_loss = -torch.logsumexp(masked_logp, dim=-1)
+                losses[has_best] = tie_loss
+            # mask 無し: hard top1 fallback
+            if bool((~has_best).any().item()):
+                idx_hard = (~has_best).nonzero(as_tuple=False).flatten()
+                tgts_hard = d_targets[idx_hard]
+                hard_loss = F.cross_entropy(
+                    d_logits[idx_hard], tgts_hard, reduction="none"
+                )
+                losses[idx_hard] = hard_loss
+            discard_loss = losses.mean()
+            with torch.no_grad():
+                # tie-aware accuracy: best_mask を持つ sample では
+                # argmax が best_set 内のどれかに当たれば correct、
+                # mask 無し sample は hard top1 一致で correct (= loss semantics と整合)。
+                argmax_idx = d_logits.argmax(dim=-1)  # (M,)
+                correct = torch.zeros(
+                    argmax_idx.size(0),
+                    device=argmax_idx.device,
+                    dtype=torch.bool,
+                )
+                if bool(has_best.any().item()):
+                    # gather mask 値: d_masks[i, argmax_idx[i]] が > 0 なら correct
+                    chosen_mask_val = d_masks.gather(
+                        1, argmax_idx.unsqueeze(1)
+                    ).squeeze(1)  # (M,)
+                    correct |= (has_best & (chosen_mask_val > 0))
+                if bool((~has_best).any().item()):
+                    correct |= ((~has_best) & (argmax_idx == d_targets))
+                discard_correct = int(correct.sum().item())
+        else:
+            discard_loss = F.cross_entropy(d_logits, d_targets, reduction="mean")
+            with torch.no_grad():
+                discard_correct = int(
+                    (d_logits.argmax(dim=-1) == d_targets).sum().item()
+                )
     else:
         discard_loss = _zero_loss(device)
 

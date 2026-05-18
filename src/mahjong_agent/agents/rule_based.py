@@ -1,50 +1,42 @@
-"""Minimal rule-based baseline agent.
+"""Rule-based baseline agent (Stage02 parity rev)。
 
-imitation warm start や evaluation 用に、合法に動き、明らかな win action を
-取りこぼさない最小 baseline を提供する。強さは主目的ではなく、後段の
-imitation teacher / 比較対象として使える「動く baseline」を作ることが目的。
+``baseline/`` package の ``compute_shanten`` / ``count_acceptance`` /
+``find_best_discard`` / ``RuleBasedCallPolicy`` を使って、shanten 最小化 +
+ukeire 最大化の通常打牌と、shape ベース heuristic 系統の副露判断を行う。
 
 特徴
 ----
-- hidden info を一切使わない。入力は ``LegalActionSet`` (model-facing legal
-  actions) と、optional な public observation のみ。
-- 物理 tile id (赤牌か通常牌か) の選択は agent 側で行わず、resolver /
-  action abstraction (``ModelAction._raw_actions``) に任せる。
-- 同じ tile_type が複数 raw discard を持っていても、agent からは tile_type
-  単位でしか選択しない。
+- hidden info を一切使わない。入力は ``LegalActionSet`` と (optional な)
+  ``riichienv.Observation``。observation が無いときは legacy fallback
+  ("最大 tile_type を切る") に倒れる。
+- 物理 tile id (赤牌か通常牌か) の選択は resolver / action abstraction
+  に任せる。agent は tile_type 単位だけを見る。
+- 同率最良候補は 34-dim ``teacher_best_mask`` として
+  ``AgentDecision.extras["teacher_best_mask"]`` に格納する。``SelfPlayRunner``
+  はこれを ``DecisionSample.teacher_best_mask`` / ``teacher_*`` に書き出す
+  (tie-aware imitation loss の soft target で使う)。
 
 優先順位 (上から順に最初に該当した action を選ぶ)
------------------------------------------------
+-------------------------------------------------
 1. **Tsumo / Ron**: candidate に win action があれば必ず選ぶ。
-2. **KyushuKyuhai**: 取れるなら取る。手詰まりを増やさない安全側のデフォルト。
-3. **Normal discard**: 通常打牌が legal なら、合法 tile_type から
-   deterministic に 1 つ選ぶ。具体的には **最も大きい tile_type** を選ぶ
-   (字牌 27..33 > 9m/9p/9s/8m/8p/8s.. などの順)。これは「字牌は早めに
-   切られやすい」という弱い prior に従った deterministic な選び方で、
-   teacher としてではなく「壊れない default」として動作させる目的。
-4. **RiichiDiscard**: 通常打牌が無く RiichiDiscard だけが残っている (env が
-   discard 強制している) 例外ケースで、tile_type 昇順の先頭を選ぶ。
-   通常時はリーチを **自動で打たない** (rule_base は基本的に dama 寄り)。
-5. **Pass**: response (鳴き応答 / 自家 optional) で Pass があれば Pass する。
-   teacher としては「鳴かない / 暗槓しない」が安全側の default。
-6. **Kita** (3P): 取れるなら取る。4P では発生しない。
-7. **Ankan / Kakan**: 他に取れる option が無いときの fallback (基本的には
-   起こらない経路)。
-8. **Chi / Pon / Daiminkan**: 同上の fallback。
-
-注意
-----
-- hidden info を見ないため、teacher として強くはない。imitation warm start
-  には十分とは限らず、後続 issue でより強い baseline / human data に
-  置き換える想定。
-- 「常に Pass」「常に highest tile_type を discard」という選び方は単純で
-  predictable な baseline だが、deterministic に teacher target を作れる
-  という利点もある (同じ legal_set には常に同じ decision が返る)。
+2. **KyushuKyuhai**: 取れるなら取る。
+3. **Normal discard**: shanten 最小化 + ukeire 最大化で 1 つ選ぶ。
+   observation 無し / 計算失敗時は legacy fallback (= 最大 tile_type)。
+4. **RiichiDiscard**: 通常打牌が無く RiichiDiscard だけが残っている例外
+   ケースで、tile_type 昇順の先頭を選ぶ。通常時はリーチを自動で打たない。
+5. **副露評価**: ``RuleBasedCallPolicy`` で CHI / PON / DAIMINKAN を採点。
+   PASS が最高 score なら PASS。
+6. **Pass** (= response phase で call score 0 のとき)。
+7. **Kita** (3P): 取れるなら取る。
+8. **Ankan / Kakan**: 他に取れる option が無いときの fallback。
+9. **Chi / Pon / Daiminkan**: 同上の fallback。
 """
 from __future__ import annotations
 
 import random
 from typing import Any
+
+import numpy as np
 
 from mahjong_agent.actions.types import (
     ActionFamily,
@@ -52,9 +44,13 @@ from mahjong_agent.actions.types import (
     ModelAction,
 )
 from mahjong_agent.agents.base import AgentDecision
+from mahjong_agent.baseline.call_policy import (
+    RuleBasedCallPolicy,
+    extract_hand_counts,
+    extract_own_meld_count,
+)
+from mahjong_agent.baseline.discard_select import find_best_discard
 
-# 鳴き / 自家 optional で fallback として最後に取りうる family の順序。
-# pass を取ったあとに到達する想定なので通常は使われない。
 _CALL_FALLBACK_ORDER: tuple[ActionFamily, ...] = (
     ActionFamily.ANKAN,
     ActionFamily.KAKAN,
@@ -62,21 +58,37 @@ _CALL_FALLBACK_ORDER: tuple[ActionFamily, ...] = (
     ActionFamily.PON,
     ActionFamily.DAIMINKAN,
 )
+_NUM_TILE_TYPES = 34
 
 
 class RuleBasedBaselineAgent:
-    """最小 rule-based baseline。
+    """Stage02 parity rev rule-based baseline。
 
     Parameters
     ----------
     seed:
-        tie-breaking などで rng が必要になった場合に備える slot。現実装では
-        deterministic に動くので未使用だが、後続 issue で rule を強化したい
-        場合のために用意。
+        tie-breaking 等で rng が必要になった場合に備える slot。現実装では
+        deterministic に動くため未使用だが、後段で同率複数候補から sample
+        するモードを足したい場合に使う。
+    use_call_policy:
+        ``True`` (default) で ``RuleBasedCallPolicy`` を使って CHI/PON/
+        DAIMINKAN を評価する。``False`` で legacy "常に PASS" 動作。
+    use_shanten_discard:
+        ``True`` (default) で shanten 最小化 + ukeire 最大化の通常打牌。
+        ``False`` で legacy "最大 tile_type" fallback。
     """
 
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        *,
+        use_call_policy: bool = True,
+        use_shanten_discard: bool = True,
+    ) -> None:
         self._rng = random.Random(seed)
+        self._use_call_policy = bool(use_call_policy)
+        self._use_shanten_discard = bool(use_shanten_discard)
+        self._call_policy = RuleBasedCallPolicy()
 
     # ------------------------------------------------------------------
     # main entry
@@ -91,25 +103,14 @@ class RuleBasedBaselineAgent:
     ) -> AgentDecision:
         """priority list に従って 1 つ action を選ぶ。
 
-        Parameters
-        ----------
-        legal_set:
-            model-facing legal actions。
-        rng:
-            override 用 rng。現実装では使わない。
-        observation:
-            public observation。現実装では使わない。
+        normal_discard を選んだときは ``AgentDecision.extras`` に以下を入れる:
 
-        Returns
-        -------
-        AgentDecision
-
-        Raises
-        ------
-        ValueError:
-            normal_discard も candidates も空のとき。
+        - ``teacher_best_mask``: ``(34,) float32`` 同率最良 tile_type mask
+        - ``teacher_discard_tile_type``: ``int`` 同率最良の先頭 tile_type
+        - ``teacher_shanten``: ``int`` 打牌後 shanten
+        - ``teacher_ukeire``: ``int`` 打牌後 ukeire (= 受け入れ枚数)
         """
-        del observation, rng  # unused in current minimal heuristic
+        del rng  # rule_base は deterministic に動くので未使用
 
         cand_by_family = self._group_candidates(legal_set)
 
@@ -130,34 +131,47 @@ class RuleBasedBaselineAgent:
 
         # 3) Normal discard
         if legal_set.normal_discard:
-            tile_type = self._pick_normal_discard_tile_type(legal_set)
-            return AgentDecision(
-                action=legal_set.normal_discard[tile_type],
-                rationale="normal_discard",
-            )
+            return self._decide_normal_discard(legal_set, observation)
 
-        # 4) RiichiDiscard fallback (通常打牌が無いとき限定)
+        # 4) RiichiDiscard fallback
         if ActionFamily.RIICHI_DISCARD in cand_by_family:
             chosen = self._pick_riichi_discard(
                 cand_by_family[ActionFamily.RIICHI_DISCARD]
             )
             return AgentDecision(action=chosen, rationale="riichi_discard_fallback")
 
-        # 5) Pass
+        # 5) Response (call policy)
+        if self._use_call_policy and any(
+            f in cand_by_family
+            for f in (ActionFamily.CHI, ActionFamily.PON, ActionFamily.DAIMINKAN)
+        ):
+            hand_counts = extract_hand_counts(observation)
+            if hand_counts is not None:
+                evaluation = self._call_policy.select_call(
+                    legal_set, hand_counts
+                )
+                if evaluation is not None:
+                    return AgentDecision(
+                        action=evaluation.candidate,
+                        rationale=f"call:{evaluation.rationale}",
+                        extras={"call_score": float(evaluation.score)},
+                    )
+
+        # 6) Pass
         if ActionFamily.PASS in cand_by_family:
             return AgentDecision(
                 action=cand_by_family[ActionFamily.PASS][0],
                 rationale="pass",
             )
 
-        # 6) Kita
+        # 7) Kita
         if ActionFamily.KITA in cand_by_family:
             return AgentDecision(
                 action=cand_by_family[ActionFamily.KITA][0],
                 rationale="kita",
             )
 
-        # 7-8) Other call fallback
+        # 8-9) Other call fallback
         for fam in _CALL_FALLBACK_ORDER:
             if fam in cand_by_family:
                 return AgentDecision(
@@ -169,6 +183,66 @@ class RuleBasedBaselineAgent:
             f"RuleBasedBaselineAgent: legal_set for player "
             f"{legal_set.decision_player} has no normal_discard and no "
             f"candidates"
+        )
+
+    # ------------------------------------------------------------------
+    # normal discard branch
+    # ------------------------------------------------------------------
+
+    def _decide_normal_discard(
+        self,
+        legal_set: LegalActionSet,
+        observation: Any | None,
+    ) -> AgentDecision:
+        """通常打牌を選ぶ。shanten min + ukeire max が default。"""
+        # observation が無い or shanten モードが off なら legacy fallback。
+        hand_counts = (
+            extract_hand_counts(observation)
+            if self._use_shanten_discard
+            else None
+        )
+        if hand_counts is None:
+            tile_type = self._pick_normal_discard_tile_type(legal_set)
+            return AgentDecision(
+                action=legal_set.normal_discard[tile_type],
+                rationale="normal_discard:fallback_max_tt",
+            )
+
+        legal_mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+        for tt in legal_set.normal_discard.keys():
+            if 0 <= tt < _NUM_TILE_TYPES:
+                legal_mask[tt] = 1.0
+        meld_count = extract_own_meld_count(observation)
+        result = find_best_discard(
+            hand_counts, legal_mask, meld_count=meld_count
+        )
+        if result.best_tile_type < 0:
+            # shanten 計算上 legal discard 不在 (ex: 異常な obs)。fallback。
+            tile_type = self._pick_normal_discard_tile_type(legal_set)
+            return AgentDecision(
+                action=legal_set.normal_discard[tile_type],
+                rationale="normal_discard:fallback_no_best",
+            )
+
+        chosen_tt = result.best_tile_type
+        if chosen_tt not in legal_set.normal_discard:
+            # find_best_discard が選んだ tile_type が legal_set 側に無い
+            # 病的ケース (= legal_mask と normal_discard.keys() の不一致)。
+            # legal_set を真とし、mask から最初の legal を選ぶ。
+            tile_type = self._pick_normal_discard_tile_type(legal_set)
+            return AgentDecision(
+                action=legal_set.normal_discard[tile_type],
+                rationale="normal_discard:legal_set_mismatch",
+            )
+        return AgentDecision(
+            action=legal_set.normal_discard[chosen_tt],
+            rationale="normal_discard:shanten_min",
+            extras={
+                "teacher_best_mask": result.best_mask,
+                "teacher_discard_tile_type": int(chosen_tt),
+                "teacher_shanten": int(result.best_shanten),
+                "teacher_ukeire": int(result.best_acceptance),
+            },
         )
 
     # ------------------------------------------------------------------
@@ -186,9 +260,8 @@ class RuleBasedBaselineAgent:
 
     @staticmethod
     def _pick_normal_discard_tile_type(legal_set: LegalActionSet) -> int:
-        """合法 tile_type のうち最大のものを返す (字牌寄りの safe default)。"""
+        """fallback: 合法 tile_type のうち最大のもの (legacy)。"""
         tts = legal_set.normal_discard_tile_types()
-        # normal_discard が空でないことは caller 側で検査済み。
         return tts[-1]
 
     @staticmethod

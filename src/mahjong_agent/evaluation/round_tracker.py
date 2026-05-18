@@ -384,6 +384,9 @@ def _meld_is_open(meld: Any) -> bool:
     return str(mtype).rsplit(".", 1)[-1] != "Ankan"
 
 
+_DISCARD_MASK_DIM_T: int = 34
+
+
 def make_initial_sample(
     *,
     episode_id: str,
@@ -398,13 +401,32 @@ def make_initial_sample(
     selected_discard_tile_type: int,
     selected_candidate_index: int,
     metadata: dict[str, Any] | None = None,
+    teacher_discard_tile_type: int = -1,
+    teacher_candidate_index: int = -1,
+    teacher_best_mask: np.ndarray | None = None,
+    teacher_available: bool = False,
+    old_log_prob: float = 0.0,
+    value: float = 0.0,
 ) -> DecisionSample:
     """まだ round/game 終了が分からない段階の DecisionSample を組み立てる。
 
     score_delta / reward / round_over / terminated / terminal_class /
     yaku_target / yaku_loss_mask / han / fu は ``RoundTracker`` が後段で
     backfill する。
+
+    ``teacher_*`` / ``old_log_prob`` / ``value`` は agent が出力した
+    ``AgentDecision.extras`` から caller が転記する想定。未提供時は
+    default (``-1`` / 0.0 / False / 全 0 mask)。
     """
+    if teacher_best_mask is None:
+        tbm = np.zeros(_DISCARD_MASK_DIM_T, dtype=np.float32)
+    else:
+        tbm = np.asarray(teacher_best_mask, dtype=np.float32).reshape(-1)
+        if tbm.size != _DISCARD_MASK_DIM_T:
+            raise ValueError(
+                f"teacher_best_mask must be length {_DISCARD_MASK_DIM_T}, "
+                f"got {tbm.size}"
+            )
     return DecisionSample(
         schema_version=SCHEMA_VERSION,
         episode_id=str(episode_id),
@@ -418,8 +440,8 @@ def make_initial_sample(
         candidate_features=np.asarray(candidate_features, dtype=np.float32),
         selected_discard_tile_type=int(selected_discard_tile_type),
         selected_candidate_index=int(selected_candidate_index),
-        old_log_prob=0.0,
-        value=0.0,
+        old_log_prob=float(old_log_prob),
+        value=float(value),
         reward=0.0,
         terminated=False,
         round_over=False,
@@ -429,9 +451,10 @@ def make_initial_sample(
         han=-1,
         fu=-1,
         score_delta=0,
-        teacher_discard_tile_type=-1,
-        teacher_candidate_index=-1,
-        teacher_available=False,
+        teacher_discard_tile_type=int(teacher_discard_tile_type),
+        teacher_candidate_index=int(teacher_candidate_index),
+        teacher_best_mask=tbm,
+        teacher_available=bool(teacher_available),
         metadata=dict(metadata or {}),
     )
 

@@ -492,6 +492,164 @@ def test_compute_imitation_loss_signature_does_not_take_hidden_inputs():
 
 
 # ----------------------------------------------------------------------
+# tie-aware imitation: accuracy / loss semantics
+# ----------------------------------------------------------------------
+
+
+def _force_discard_argmax(model: Stage03Model, tile_type: int) -> None:
+    """``discard_head`` を logits = one-hot(tile_type) 相当に固定する helper。
+
+    weight=0, bias は tile_type のみ正、その他は大きく負にすることで、
+    任意の trunk 出力に対して argmax が ``tile_type`` になる
+    (discard_mask が当該 tile を許可している前提)。
+    """
+    with torch.no_grad():
+        model.discard_head.weight.zero_()
+        bias = torch.full_like(model.discard_head.bias, -100.0)
+        bias[int(tile_type)] = 100.0
+        model.discard_head.bias.copy_(bias)
+
+
+def _make_discard_sample_with_best_mask(
+    *,
+    selected_tile: int,
+    legal_tiles: tuple[int, ...],
+    best_tiles: tuple[int, ...] | None,
+    step_id: int = 0,
+) -> DecisionSample:
+    """best_mask を任意に設定できる discard sample factory。
+
+    best_tiles=None / 空 tuple なら ``teacher_best_mask`` は全 0 (= 未提供扱い)。
+    """
+    s = _make_discard_sample(
+        tile_type=selected_tile, legal_tiles=legal_tiles, step_id=step_id
+    )
+    if best_tiles:
+        mask = np.zeros(34, dtype=np.float32)
+        for t in best_tiles:
+            mask[int(t)] = 1.0
+        s.teacher_best_mask = mask
+    return s
+
+
+def test_tie_aware_accuracy_counts_argmax_in_best_mask_as_correct():
+    """tie_aware_discard=True で best_mask 内の別 tile を argmax した場合、
+    loss semantics 的に正解として ``accuracy_discard=1.0`` になること。
+    """
+    torch.manual_seed(0)
+    model = _build_model()
+    # 切る tile を argmax として固定 (tile_type=3 を argmax にする)
+    _force_discard_argmax(model, tile_type=3)
+    # target は 5 (best_mask に 3 と 5 を含めるので tie-aware では正解扱い)
+    samples = [
+        _make_discard_sample_with_best_mask(
+            selected_tile=5,
+            legal_tiles=(3, 5, 7),
+            best_tiles=(3, 5),
+            step_id=i,
+        )
+        for i in range(4)
+    ]
+    batch = collate_decision_samples(samples)
+    _, metrics = compute_imitation_loss(
+        model,
+        batch,
+        ImitationConfig(
+            tie_aware_discard=True,
+            terminal_loss_coef=0.0,
+            yaku_loss_coef=0.0,
+        ),
+    )
+    assert metrics.discard_count == 4
+    assert metrics.accuracy_discard == pytest.approx(1.0)
+
+
+def test_tie_aware_accuracy_falls_back_to_hard_top1_when_best_mask_empty():
+    """tie_aware_discard=True でも best_mask 全 0 の sample では hard top-1
+    一致でのみ correct (target != argmax → accuracy 0)。"""
+    torch.manual_seed(0)
+    model = _build_model()
+    _force_discard_argmax(model, tile_type=3)
+    # target=5, best_mask は未提供 (全 0) → hard top1 fallback。
+    # argmax=3 != target=5 なので不一致 → accuracy=0.
+    samples_miss = [
+        _make_discard_sample_with_best_mask(
+            selected_tile=5,
+            legal_tiles=(3, 5, 7),
+            best_tiles=None,
+            step_id=i,
+        )
+        for i in range(4)
+    ]
+    batch_miss = collate_decision_samples(samples_miss)
+    _, metrics_miss = compute_imitation_loss(
+        model,
+        batch_miss,
+        ImitationConfig(
+            tie_aware_discard=True,
+            terminal_loss_coef=0.0,
+            yaku_loss_coef=0.0,
+        ),
+    )
+    assert metrics_miss.discard_count == 4
+    assert metrics_miss.accuracy_discard == pytest.approx(0.0)
+
+    # 同条件で target=3 (= argmax) なら hard top1 一致 → accuracy=1.0
+    samples_hit = [
+        _make_discard_sample_with_best_mask(
+            selected_tile=3,
+            legal_tiles=(3, 5, 7),
+            best_tiles=None,
+            step_id=100 + i,
+        )
+        for i in range(4)
+    ]
+    batch_hit = collate_decision_samples(samples_hit)
+    _, metrics_hit = compute_imitation_loss(
+        model,
+        batch_hit,
+        ImitationConfig(
+            tie_aware_discard=True,
+            terminal_loss_coef=0.0,
+            yaku_loss_coef=0.0,
+        ),
+    )
+    assert metrics_hit.discard_count == 4
+    assert metrics_hit.accuracy_discard == pytest.approx(1.0)
+
+
+def test_tie_aware_off_uses_hard_top1_even_with_best_mask():
+    """tie_aware_discard=False では best_mask があっても hard top-1 のみで
+    accuracy を計算する (旧仕様互換)。"""
+    torch.manual_seed(0)
+    model = _build_model()
+    _force_discard_argmax(model, tile_type=3)
+    # tie-aware ON なら best_mask に 3 が居るので正解扱いになる条件だが、
+    # tie_aware_discard=False なので argmax=3 != target=5 → accuracy=0。
+    samples = [
+        _make_discard_sample_with_best_mask(
+            selected_tile=5,
+            legal_tiles=(3, 5, 7),
+            best_tiles=(3, 5),
+            step_id=i,
+        )
+        for i in range(4)
+    ]
+    batch = collate_decision_samples(samples)
+    _, metrics = compute_imitation_loss(
+        model,
+        batch,
+        ImitationConfig(
+            tie_aware_discard=False,
+            terminal_loss_coef=0.0,
+            yaku_loss_coef=0.0,
+        ),
+    )
+    assert metrics.discard_count == 4
+    assert metrics.accuracy_discard == pytest.approx(0.0)
+
+
+# ----------------------------------------------------------------------
 # Pre-collated batches path
 # ----------------------------------------------------------------------
 

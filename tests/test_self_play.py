@@ -24,6 +24,7 @@ from mahjong_agent.data import (
     read_decision_shard,
     write_decision_shard,
 )
+from mahjong_agent.encoders import PublicObservationEncoder
 from mahjong_agent.evaluation import (
     EpisodeResult,
     RoundTracker,
@@ -33,6 +34,10 @@ from mahjong_agent.evaluation import (
     aggregate_metrics,
     make_initial_sample,
 )
+
+# encoder の現行 dim (hints on でも off でも自動追従)
+_ENCODER_OBS_DIM: int = PublicObservationEncoder().metadata().observation_dim
+_ENCODER_CAND_DIM: int = PublicObservationEncoder().metadata().candidate_dim
 
 # ----------------------------------------------------------------------
 # SeatAgents
@@ -93,7 +98,7 @@ def test_round_tracker_consume_mjai_for_hora_backfills():
         player_id=1,
         decision_family=ActionFamily.NORMAL_DISCARD.value,
         actor_type="random",
-        observation_feat=np.zeros(363, dtype=np.float32),
+        observation_feat=np.zeros(_ENCODER_OBS_DIM, dtype=np.float32),
         discard_mask=np.zeros(34, dtype=np.float32),
         candidate_features=np.zeros((0, 12), dtype=np.float32),
         selected_discard_tile_type=5,
@@ -140,7 +145,7 @@ def test_round_tracker_consume_mjai_for_ryukyoku_tenpai():
         player_id=2,
         decision_family=ActionFamily.NORMAL_DISCARD.value,
         actor_type="random",
-        observation_feat=np.zeros(363, dtype=np.float32),
+        observation_feat=np.zeros(_ENCODER_OBS_DIM, dtype=np.float32),
         discard_mask=np.zeros(34, dtype=np.float32),
         candidate_features=np.zeros((0, 12), dtype=np.float32),
         selected_discard_tile_type=0,
@@ -531,10 +536,10 @@ def test_episode_samples_are_decision_samples():
     assert all(s.schema_version == SCHEMA_VERSION for s in res.samples)
     # 各 sample が observation / discard_mask / cand feature を持つ
     for s in res.samples[:10]:
-        assert s.observation.shape == (363,)
+        assert s.observation.shape == (_ENCODER_OBS_DIM,)
         assert s.discard_mask.shape == (34,)
         assert s.candidate_features.ndim == 2
-        assert s.candidate_features.shape[1] in (0, 86)
+        assert s.candidate_features.shape[1] in (0, _ENCODER_CAND_DIM)
     # round_over=True が各 round の per-player 終端のみ立っている
     # 同じ (round_id, player_id) に対して round_over=True は最大 1 個
     for (rid, pid) in {(s.round_id, s.player_id) for s in res.samples}:
@@ -871,7 +876,7 @@ def _dummy_legal_set(actor=0):
 
 
 def test_make_initial_sample_defaults_are_clean():
-    feat = np.zeros(363, dtype=np.float32)
+    feat = np.zeros(_ENCODER_OBS_DIM, dtype=np.float32)
     s = make_initial_sample(
         episode_id="x",
         round_idx=0,

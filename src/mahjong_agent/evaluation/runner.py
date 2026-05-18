@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import riichienv
 
 from mahjong_agent.actions.convert import legal_actions_to_model_set
@@ -403,6 +404,7 @@ class SelfPlayRunner:
                 legal_set=legal_set,
                 decision_action=decision.action,
                 rationale=decision.rationale,
+                extras=dict(decision.extras),
             )
             tracker.append_pending(sample)
         step_id_counter += 1
@@ -473,6 +475,7 @@ class SelfPlayRunner:
                     legal_set=legal_set,
                     decision_action=decision.action,
                     rationale=decision.rationale,
+                    extras=dict(decision.extras),
                 )
                 tracker.append_pending(sample)
             step_id_counter += 1
@@ -531,8 +534,15 @@ class SelfPlayRunner:
         legal_set: LegalActionSet,
         decision_action: ModelAction,
         rationale: str,
+        extras: dict[str, Any] | None = None,
     ) -> DecisionSample:
-        observation_feat = self.encoder.encode_observation(obs)
+        # ``ModelPolicyAgent`` 等が ``extras["observation_feat"]`` に encoder
+        # 出力済み feature (= numpy float32, shape=(observation_dim,)) を
+        # 載せている場合、再 encode をスキップする。shape mismatch は
+        # fail-fast (= 差し替え可能な silent corruption を防ぐ)。
+        observation_feat = self._observation_feat_from_extras_or_encode(
+            obs, extras
+        )
         discard_mask = self.encoder.discard_legal_mask(legal_set)
         cand_feat = self.encoder.encode_candidates(legal_set)
         family = decision_action.family
@@ -545,6 +555,29 @@ class SelfPlayRunner:
         metadata: dict[str, Any] = {
             "rationale": str(rationale),
         }
+        # AgentDecision.extras から teacher / on-policy 情報を取り出す
+        extras = extras or {}
+        teacher_best_mask = extras.get("teacher_best_mask")
+        teacher_tt = int(
+            extras.get("teacher_discard_tile_type", -1)
+        )
+        teacher_ci = int(extras.get("teacher_candidate_index", -1))
+        teacher_available = bool(
+            (teacher_best_mask is not None and teacher_best_mask.any())
+            or teacher_tt >= 0
+            or teacher_ci >= 0
+        )
+        old_log_prob = float(extras.get("log_prob", 0.0))
+        value = float(extras.get("value", 0.0))
+        # 数値化されない補助 metric は metadata に追記する
+        for k in ("teacher_shanten", "teacher_ukeire", "call_score"):
+            if k in extras:
+                metadata[k] = float(extras[k])
+        # PPO eligibility 用フラグ: deterministic shortcut (TSUMO/RON/KYUSHU
+        # 等) はここで True が入る。``compute_returns_and_advantages`` は
+        # この flag を見て eligible=False に倒す。
+        if bool(extras.get("ppo_exclude", False)):
+            metadata["ppo_exclude"] = True
         return make_initial_sample(
             episode_id=episode_id,
             round_idx=round_idx,
@@ -558,7 +591,48 @@ class SelfPlayRunner:
             selected_discard_tile_type=sel_tt,
             selected_candidate_index=sel_idx,
             metadata=metadata,
+            teacher_discard_tile_type=teacher_tt,
+            teacher_candidate_index=teacher_ci,
+            teacher_best_mask=teacher_best_mask,
+            teacher_available=teacher_available,
+            old_log_prob=old_log_prob,
+            value=value,
         )
+
+    def _observation_feat_from_extras_or_encode(
+        self,
+        obs: Any,
+        extras: dict[str, Any] | None,
+    ) -> np.ndarray:
+        """``extras["observation_feat"]`` があれば再利用、無ければ encode する。
+
+        validation
+        ----------
+        - shape は ``(self.encoder.metadata().observation_dim,)`` でないと
+          ``ValueError`` で fail-fast。
+        - dtype は ``np.float32`` に正規化する (= 別 dtype が来ても accept する
+          がコピー 1 回挟まる)。
+        - 任意の追加 hidden info が混入しないように、numpy array 以外は
+          encoder fallback に倒す (= dict / object / None など扱わない)。
+        """
+        if extras is not None:
+            cached = extras.get("observation_feat")
+            if cached is not None:
+                if not isinstance(cached, np.ndarray):
+                    raise TypeError(
+                        f"extras['observation_feat'] must be np.ndarray, "
+                        f"got {type(cached).__name__}"
+                    )
+                expected_dim = int(self.encoder.metadata().observation_dim)
+                feat = np.asarray(cached, dtype=np.float32).reshape(-1)
+                if feat.shape != (expected_dim,):
+                    raise ValueError(
+                        f"extras['observation_feat'] shape "
+                        f"{cached.shape if hasattr(cached, 'shape') else 'unknown'} "
+                        f"mismatches encoder.observation_dim={expected_dim}"
+                    )
+                return feat
+        return self.encoder.encode_observation(obs)
 
 
 def _find_candidate_index(

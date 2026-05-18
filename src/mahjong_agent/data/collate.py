@@ -125,6 +125,17 @@ def collate_decision_samples(samples: list[DecisionSample]) -> DecisionBatch:
             )
         yaku_target[i] = arr
 
+    # teacher_best_mask
+    teacher_best_mask = np.zeros((n, _DISCARD_MASK_DIM), dtype=np.float32)
+    for i, s in enumerate(samples):
+        arr = np.asarray(s.teacher_best_mask, dtype=np.float32).reshape(-1)
+        if arr.size != _DISCARD_MASK_DIM:
+            raise ValueError(
+                f"sample {i}: teacher_best_mask size {arr.size} mismatches "
+                f"expected {_DISCARD_MASK_DIM}"
+            )
+        teacher_best_mask[i] = arr
+
     def _int_t(getter):
         return torch.tensor(
             [int(getter(s)) for s in samples], dtype=torch.int64
@@ -166,6 +177,7 @@ def collate_decision_samples(samples: list[DecisionSample]) -> DecisionBatch:
             lambda s: s.teacher_discard_tile_type
         ),
         teacher_candidate_index=_int_t(lambda s: s.teacher_candidate_index),
+        teacher_best_mask=torch.from_numpy(teacher_best_mask),
         teacher_available=_float_t(
             lambda s: 1.0 if s.teacher_available else 0.0
         ),

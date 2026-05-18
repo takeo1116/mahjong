@@ -317,6 +317,11 @@ def compute_returns_and_advantages(
     for i, s in enumerate(samples):
         if str(s.actor_type) not in include_set:
             continue
+        # deterministic shortcut (e.g., TSUMO/RON/KYUSHU の auto-take) は
+        # log_prob が定数 0 で意味を持たないため、ratio 計算から除外する。
+        # ``ModelPolicyAgent`` 経由でこの flag を立てる。
+        if bool(s.metadata.get("ppo_exclude", False)):
+            continue
         if str(s.decision_family) == _NORMAL_DISCARD_FAMILY:
             if int(s.selected_discard_tile_type) < 0:
                 continue
@@ -372,22 +377,46 @@ def compute_ppo_loss(
 ) -> tuple[torch.Tensor, PPOMetrics]:
     """1 batch 分の PPO loss と metrics を返す。
 
-    Loss
-    ----
-    - discard PPO loss: ``decision_family == "normal_discard"`` かつ
-      ``selected_discard_tile_type >= 0`` かつ ``eligible`` (= actor_type ∈
-      include_actor_types) の sample 対象。``model.forward(obs, discard_mask)``
-      の masked discard_logits から chosen action の log_prob を取り、
-      ``old_log_prob`` との ratio + clipped objective。
-    - candidate PPO loss: 同様に candidate 対象 sample で
-      ``model.score_candidates(obs, cand_feat)`` の masked score の log_prob
-      vs ``old_log_prob`` で clipped objective。
+    Combined log_prob 仕様 (Stage03 specific)
+    ----------------------------------------
+    Stage03 の ``ModelPolicyAgent`` は normal discard logits (34) と
+    candidate scores (Cmax) を **1 本のベクトル (34 + Cmax)** に concat
+    した combined softmax で action を sample する。``compute_ppo_loss``
+    でも同じ combined distribution から ``new_log_prob`` を計算しないと、
+    同一 model rollout 直後の ratio が 1 にならない (= PPO の前提崩壊)。
+
+    本実装は combined ベクトルを再構築する:
+
+    - ``combined_logits = [masked_discard_logits (B, 34), masked_cand_scores (B, Cmax)]``
+    - ``masked_discard_logits`` は ``model.forward(obs, discard_mask)`` が既に
+      illegal idx を ``-1e9`` 化したもの。
+    - ``masked_cand_scores`` は ``model.score_candidates(...)`` の出力に
+      ``(1 - candidate_mask) * -1e9`` を加えた padding-masked 版。
+    - 選択 index:
+        - discard sample: ``selected_discard_tile_type``
+        - candidate sample: ``34 + selected_candidate_index``
+    - ``new_log_prob = log_softmax(combined_logits, dim=-1)[combined_idx]``
+    - ratio / clip / KL / entropy も combined distribution 上で計算する。
+
+    Per-family diagnostics (``decision_family`` subdict) は combined loss を
+    sample 単位で計算した後、family ごとに集計するだけ。
+
+    Stage03 では env の 1 つの ``WaitAct`` で normal_discard と candidate
+    (TSUMO / Ankan / Riichi 等) が **同時に legal** になるため、combined
+    softmax が必要。
+
+    Loss 全体
+    --------
+    - policy_loss = - min(ratio * adv, clip(ratio) * adv) の eligible 平均
     - value loss: ``policy_only=False`` のとき eligible sample で
       ``0.5 * MSE(value_pred, returns)``。
-    - entropy bonus: policy 対象 sample (discard / candidate) の categorical
-      entropy 平均。
+    - entropy bonus: combined categorical entropy の eligible 平均。
     - terminal / yaku aux: ``policy_only=False`` のとき imitation trainer
       と同じ semantics (terminal_class >= 0 / yaku_loss_mask > 0)。
+
+    Deterministic shortcut (TSUMO/RON/KYUSHU) は
+    ``compute_returns_and_advantages`` で ``metadata["ppo_exclude"]=True``
+    に基づき eligibility から除外する設計。本関数内では特別扱いしない。
 
     Total
     -----
@@ -426,6 +455,39 @@ def compute_ppo_loss(
     )
     is_candidate_family = ~is_normal
 
+    # ---- Forward (both heads) ----
+    fwd = model(obs, discard_mask=discard_mask)
+    # ``fwd.discard_logits`` は model 側で discard_mask 適用済み (illegal は
+    # -1e9 が加算されている)。
+    cand_out = model.score_candidates(obs, cand_feat)
+    cand_scores = cand_out.candidate_scores  # (B, Cmax)
+    cmax = int(cand_scores.size(1))
+    if cmax > 0:
+        masked_cand = cand_scores + (1.0 - cand_mask) * _LARGE_NEG
+    else:
+        masked_cand = cand_scores  # (B, 0)
+
+    # ---- Combined logits = [masked discard (B, 34), masked candidate (B, Cmax)] ----
+    combined_logits = torch.cat([fwd.discard_logits, masked_cand], dim=-1)
+    # (B, 34 + Cmax)
+    log_softmax_combined = F.log_softmax(combined_logits, dim=-1)
+
+    # Combined index per sample: discard sample → sel_disc, candidate sample
+    # → 34 + sel_cand。Eligibility check は別途下で行うので、無効値は
+    # 0 にクランプして gather index out-of-range を防ぐ。
+    combined_dim = combined_logits.size(-1)
+    combined_idx_disc = sel_disc.clamp(min=0)
+    combined_idx_cand = (sel_cand + 34).clamp(min=0)
+    combined_idx = torch.where(
+        is_normal, combined_idx_disc, combined_idx_cand
+    ).clamp(0, combined_dim - 1)
+
+    # per-sample new_log_prob
+    new_log_prob_all = log_softmax_combined.gather(
+        -1, combined_idx.unsqueeze(-1)
+    ).squeeze(-1)  # (B,)
+
+    # ---- per-family validity ----
     discard_valid = (
         is_normal & (sel_disc >= 0) & eligible
     )
@@ -436,56 +498,60 @@ def compute_ppo_loss(
         & (cand_count > 0)
         & eligible
     )
+    valid_mask = discard_valid | cand_valid  # (B,) bool
     discard_count = int(discard_valid.sum().item())
     candidate_count = int(cand_valid.sum().item())
 
-    fwd = model(obs, discard_mask=discard_mask)
-    cand_out = model.score_candidates(obs, cand_feat)
-    cand_scores = cand_out.candidate_scores  # (B, Cmax)
-    # masked candidate scores
-    cmax = int(cand_scores.size(1))
-    if cmax > 0:
-        masked_cand = cand_scores + (1.0 - cand_mask) * _LARGE_NEG
-    else:
-        masked_cand = cand_scores
+    # ---- Combined PPO loss ----
+    eps = float(config.clip_epsilon)
+    log_ratio_all = new_log_prob_all - old_log_prob
+    ratio_all = torch.exp(log_ratio_all)
+    clipped_all = torch.clamp(ratio_all, 1.0 - eps, 1.0 + eps)
+    # per-sample policy loss tensor (eligibility なし; aggregation 側で mask)
+    per_sample_loss = -torch.min(ratio_all * advantages, clipped_all * advantages)
+    # entropy per sample (combined categorical entropy)
+    combined_probs = torch.exp(log_softmax_combined)
+    entropy_per_sample = -(combined_probs * log_softmax_combined).sum(dim=-1)
+    # KL approx per sample
+    kl_per_sample = (ratio_all - 1.0) - log_ratio_all
+    # clip indicator
+    clip_per_sample = (
+        (ratio_all < 1.0 - eps) | (ratio_all > 1.0 + eps)
+    )
 
-    # ---------- discard PPO ----------
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        m = mask.float()
+        denom = m.sum().clamp_min(1.0)
+        return (values * m).sum() / denom
+
+    if int(valid_mask.sum().item()) > 0:
+        policy_loss_t = _masked_mean(per_sample_loss, valid_mask)
+    else:
+        policy_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+
+    # ---- per-family decomposition (diagnostics only) ----
     discard_policy_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     discard_clip_count = 0
     discard_kl_sum = torch.zeros((), device=device, dtype=torch.float32)
     discard_kl_max = 0.0
     discard_entropy_sum = torch.zeros((), device=device, dtype=torch.float32)
     if discard_count > 0:
-        idx_d = discard_valid.nonzero(as_tuple=False).flatten()
-        d_logits = fwd.discard_logits[idx_d]
-        d_log_softmax = F.log_softmax(d_logits, dim=-1)
-        d_targets = sel_disc[idx_d]
-        new_lp_d = d_log_softmax.gather(1, d_targets.unsqueeze(1)).squeeze(1)
-        old_lp_d = old_log_prob[idx_d]
-        adv_d = advantages[idx_d]
-        ratio_d = torch.exp(new_lp_d - old_lp_d)
-        clipped_d = torch.clamp(
-            ratio_d, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon
-        )
-        loss_d_per = -torch.min(ratio_d * adv_d, clipped_d * adv_d)
-        discard_policy_loss_t = loss_d_per.mean()
-        # diagnostics
+        discard_policy_loss_t = _masked_mean(per_sample_loss, discard_valid)
         with torch.no_grad():
             discard_clip_count = int(
-                ((ratio_d < 1.0 - config.clip_epsilon)
-                 | (ratio_d > 1.0 + config.clip_epsilon)).sum().item()
+                (clip_per_sample & discard_valid).sum().item()
             )
-            log_ratio_d = new_lp_d - old_lp_d
-            kl_d_per = (ratio_d - 1.0) - log_ratio_d
-            discard_kl_sum = kl_d_per.sum()
-            discard_kl_max = float(kl_d_per.max().item())
-            # entropy: categorical entropy of full discard distribution
-            d_probs = torch.softmax(d_logits, dim=-1)
-            # entropy = -sum p log p (p log p = 0 when p=0; use log_softmax)
-            ent_d = -(d_probs * d_log_softmax).sum(dim=-1)
-            discard_entropy_sum = ent_d.sum()
+            discard_kl_sum = (kl_per_sample * discard_valid.float()).sum()
+            kl_only_disc = kl_per_sample.masked_select(discard_valid)
+            discard_kl_max = (
+                float(kl_only_disc.max().item())
+                if int(kl_only_disc.numel()) > 0
+                else 0.0
+            )
+            discard_entropy_sum = (
+                entropy_per_sample * discard_valid.float()
+            ).sum()
 
-    # ---------- candidate PPO ----------
     candidate_policy_loss_t = torch.zeros(
         (), device=device, dtype=torch.float32
     )
@@ -493,34 +559,20 @@ def compute_ppo_loss(
     cand_kl_sum = torch.zeros((), device=device, dtype=torch.float32)
     cand_kl_max = 0.0
     cand_entropy_sum = torch.zeros((), device=device, dtype=torch.float32)
-    if candidate_count > 0 and cmax > 0:
-        idx_c = cand_valid.nonzero(as_tuple=False).flatten()
-        c_scores = masked_cand[idx_c]
-        c_log_softmax = F.log_softmax(c_scores, dim=-1)
-        c_targets = sel_cand[idx_c]
-        new_lp_c = c_log_softmax.gather(1, c_targets.unsqueeze(1)).squeeze(1)
-        old_lp_c = old_log_prob[idx_c]
-        adv_c = advantages[idx_c]
-        ratio_c = torch.exp(new_lp_c - old_lp_c)
-        clipped_c = torch.clamp(
-            ratio_c, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon
-        )
-        loss_c_per = -torch.min(ratio_c * adv_c, clipped_c * adv_c)
-        candidate_policy_loss_t = loss_c_per.mean()
+    if candidate_count > 0:
+        candidate_policy_loss_t = _masked_mean(per_sample_loss, cand_valid)
         with torch.no_grad():
-            cand_clip_count = int(
-                ((ratio_c < 1.0 - config.clip_epsilon)
-                 | (ratio_c > 1.0 + config.clip_epsilon)).sum().item()
+            cand_clip_count = int((clip_per_sample & cand_valid).sum().item())
+            cand_kl_sum = (kl_per_sample * cand_valid.float()).sum()
+            kl_only_cand = kl_per_sample.masked_select(cand_valid)
+            cand_kl_max = (
+                float(kl_only_cand.max().item())
+                if int(kl_only_cand.numel()) > 0
+                else 0.0
             )
-            log_ratio_c = new_lp_c - old_lp_c
-            kl_c_per = (ratio_c - 1.0) - log_ratio_c
-            cand_kl_sum = kl_c_per.sum()
-            cand_kl_max = float(kl_c_per.max().item())
-            c_probs = torch.softmax(c_scores, dim=-1)
-            ent_c = -(c_probs * c_log_softmax).sum(dim=-1)
-            cand_entropy_sum = ent_c.sum()
-
-    policy_loss_t = discard_policy_loss_t + candidate_policy_loss_t
+            cand_entropy_sum = (
+                entropy_per_sample * cand_valid.float()
+            ).sum()
 
     # ---------- value / aux (policy_only=False のみ更新) ----------
     value_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -931,32 +983,32 @@ def _component_grad_norms(
 
     components: dict[str, torch.Tensor] = {}
 
-    # policy
-    pol_loss = torch.zeros((), device=device, dtype=torch.float32)
-    if discard_valid.any():
-        idx_d = discard_valid.nonzero(as_tuple=False).flatten()
-        d_logits = fwd.discard_logits[idx_d]
-        new_lp = F.log_softmax(d_logits, dim=-1).gather(
-            1, sel_disc[idx_d].unsqueeze(1)
-        ).squeeze(1)
-        ratio = torch.exp(new_lp - old_log_prob[idx_d])
-        clipped = torch.clamp(
-            ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon
-        )
-        adv = advantages[idx_d]
-        pol_loss = pol_loss + (-torch.min(ratio * adv, clipped * adv)).mean()
-    if cand_valid.any() and cmax > 0:
-        idx_c = cand_valid.nonzero(as_tuple=False).flatten()
-        c_scores = masked_cand[idx_c]
-        new_lp = F.log_softmax(c_scores, dim=-1).gather(
-            1, sel_cand[idx_c].unsqueeze(1)
-        ).squeeze(1)
-        ratio = torch.exp(new_lp - old_log_prob[idx_c])
-        clipped = torch.clamp(
-            ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon
-        )
-        adv = advantages[idx_c]
-        pol_loss = pol_loss + (-torch.min(ratio * adv, clipped * adv)).mean()
+    # policy (combined logits を再現)
+    combined_logits = torch.cat([fwd.discard_logits, masked_cand], dim=-1)
+    combined_dim = combined_logits.size(-1)
+    log_softmax_combined = F.log_softmax(combined_logits, dim=-1)
+    combined_idx_disc = sel_disc.clamp(min=0)
+    combined_idx_cand = (sel_cand + 34).clamp(min=0)
+    combined_idx = torch.where(
+        is_normal, combined_idx_disc, combined_idx_cand
+    ).clamp(0, combined_dim - 1)
+    new_log_prob_all = log_softmax_combined.gather(
+        -1, combined_idx.unsqueeze(-1)
+    ).squeeze(-1)
+    log_ratio_all = new_log_prob_all - old_log_prob
+    ratio_all = torch.exp(log_ratio_all)
+    clipped_all = torch.clamp(
+        ratio_all, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon
+    )
+    per_sample_loss = -torch.min(
+        ratio_all * advantages, clipped_all * advantages
+    )
+    valid_mask = discard_valid | cand_valid
+    if int(valid_mask.sum().item()) > 0:
+        m = valid_mask.float()
+        pol_loss = (per_sample_loss * m).sum() / m.sum().clamp_min(1.0)
+    else:
+        pol_loss = torch.zeros((), device=device, dtype=torch.float32)
     components["policy"] = pol_loss
 
     # value

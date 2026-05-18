@@ -143,29 +143,38 @@ def _make_candidate_sample(
 
 
 def _set_old_log_probs_to_current(model: Stage03Model, samples: list[DecisionSample]):
-    """各 sample の ``old_log_prob`` を現在の model の log_prob にセットする
-    (= ratio=1 で始めるテスト用 helper)。"""
+    """各 sample の ``old_log_prob`` を現在の model の **combined** log_prob
+    に揃える (= ratio=1 で始めるテスト用 helper)。
+
+    ``compute_ppo_loss`` は combined logits ``[discard (34), candidate (Cmax)]``
+    の softmax から ``new_log_prob`` を取り出すので、old/new の formulation
+    を揃えるためにこの helper も combined を使う。
+    """
     model.eval()
     with torch.no_grad():
         batch = collate_decision_samples(samples)
         obs = batch.observation.float()
         dmask = batch.discard_mask.float()
         fwd = model(obs, discard_mask=dmask)
-        d_lp = F.log_softmax(fwd.discard_logits, dim=-1)
         cand_out = model.score_candidates(obs, batch.candidate_features.float())
         cand_mask = batch.candidate_mask.float()
-        if cand_out.candidate_scores.size(1) > 0:
-            masked = cand_out.candidate_scores + (1.0 - cand_mask) * -1e9
-            c_lp = F.log_softmax(masked, dim=-1)
+        cmax = int(cand_out.candidate_scores.size(1))
+        if cmax > 0:
+            masked_cand = cand_out.candidate_scores + (1.0 - cand_mask) * -1e9
         else:
-            c_lp = None
+            masked_cand = cand_out.candidate_scores
+        combined = torch.cat([fwd.discard_logits, masked_cand], dim=-1)
+        log_softmax = F.log_softmax(combined, dim=-1)
         for i, s in enumerate(samples):
             if s.decision_family == ActionFamily.NORMAL_DISCARD.value:
-                s.old_log_prob = float(d_lp[i, s.selected_discard_tile_type].item())
-            else:
-                if c_lp is None or s.selected_candidate_index < 0:
+                idx = int(s.selected_discard_tile_type)
+                if idx < 0:
                     continue
-                s.old_log_prob = float(c_lp[i, s.selected_candidate_index].item())
+            else:
+                if int(s.selected_candidate_index) < 0:
+                    continue
+                idx = 34 + int(s.selected_candidate_index)
+            s.old_log_prob = float(log_softmax[i, idx].item())
     model.train()
 
 

@@ -1,8 +1,15 @@
 """Decision shard writer / reader.
 
-Shard format (v1):
+Shard format (v2):
 
 1 つの ``.npz`` (np.savez_compressed) ファイルに以下を格納する。
+
+schema_version
+--------------
+- v1 (初版)
+- v2: per-sample ``teacher_best_mask`` (34-dim float32) を追加。
+  tie-aware imitation loss の soft target に使う。v1 shard は読めない
+  (fail-fast)。
 
 - shard-level metadata は JSON encode して 0-d object array
   ``"_shard_meta"`` に保存する:
@@ -218,6 +225,16 @@ def write_decision_shard(
     )
     teacher_candidate_index = _int_arr(lambda s: s.teacher_candidate_index)
     teacher_available = _bool_arr(lambda s: s.teacher_available)
+    teacher_best_mask = (
+        np.stack([
+            np.asarray(s.teacher_best_mask, dtype=np.float32).reshape(
+                _DISCARD_MASK_DIM
+            )
+            for s in samples
+        ]).astype(np.float32, copy=False)
+        if n > 0
+        else np.zeros((0, _DISCARD_MASK_DIM), dtype=np.float32)
+    )
 
     # string columns -> dtype=object arrays
     decision_family = np.array(
@@ -273,6 +290,7 @@ def write_decision_shard(
         "score_delta": score_delta,
         "teacher_discard_tile_type": teacher_discard_tile_type,
         "teacher_candidate_index": teacher_candidate_index,
+        "teacher_best_mask": teacher_best_mask,
         "teacher_available": teacher_available,
         "decision_family": decision_family,
         "actor_type": actor_type,
@@ -349,6 +367,7 @@ def read_decision_shard(path: Path | str) -> list[DecisionSample]:
         score_delta = npz["score_delta"]
         teacher_discard_tile_type = npz["teacher_discard_tile_type"]
         teacher_candidate_index = npz["teacher_candidate_index"]
+        teacher_best_mask = npz["teacher_best_mask"]
         teacher_available = npz["teacher_available"]
         decision_family = npz["decision_family"]
         actor_type = npz["actor_type"]
@@ -393,6 +412,9 @@ def read_decision_shard(path: Path | str) -> list[DecisionSample]:
                 score_delta=int(score_delta[i]),
                 teacher_discard_tile_type=int(teacher_discard_tile_type[i]),
                 teacher_candidate_index=int(teacher_candidate_index[i]),
+                teacher_best_mask=np.asarray(
+                    teacher_best_mask[i], dtype=np.float32
+                ),
                 teacher_available=bool(teacher_available[i]),
                 metadata=meta_dict,
             )

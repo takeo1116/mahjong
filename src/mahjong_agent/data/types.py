@@ -25,7 +25,9 @@ import torch
 from mahjong_agent.targets.yaku import NUM_YAKU
 
 # Sample schema バージョン。後方互換が壊れる変更ごとに +1 する。
-SCHEMA_VERSION: int = 1
+# v1: 初版
+# v2: ``teacher_best_mask`` (34-dim float) を追加
+SCHEMA_VERSION: int = 2
 
 # discard mask の固定長 (4-player tile types)
 _DISCARD_MASK_DIM: int = 34
@@ -93,6 +95,10 @@ class DecisionSample:
         teacher (rule_base) の discard 推薦 tile_type。無効なら ``-1``。
     teacher_candidate_index:
         teacher の candidate 推薦 index。無効なら ``-1``。
+    teacher_best_mask:
+        ``(34,) float32``。``RuleBasedBaselineAgent`` 等の teacher が
+        計算した「同率最良 tile_type」の multi-hot mask。未提供時は
+        全 0。tie-aware imitation loss の soft target に使う。
     teacher_available:
         teacher 情報が attach されているか。imitation 学習で mask に使う。
     metadata:
@@ -147,6 +153,9 @@ class DecisionSample:
     # teacher info
     teacher_discard_tile_type: int = -1
     teacher_candidate_index: int = -1
+    teacher_best_mask: np.ndarray = field(
+        default_factory=lambda: np.zeros(_DISCARD_MASK_DIM, dtype=np.float32)
+    )
     teacher_available: bool = False
 
     # free-form metadata
@@ -211,6 +220,7 @@ class DecisionBatch:
     # teacher
     teacher_discard_tile_type: torch.Tensor  # (N,) int64
     teacher_candidate_index: torch.Tensor    # (N,) int64
+    teacher_best_mask: torch.Tensor          # (N, 34) float32; tie-aware target
     teacher_available: torch.Tensor          # (N,) float32
 
     # forward-compat

@@ -18,7 +18,7 @@ auxiliary heads に渡せる固定長 numpy feature を生成する。
 
 利用しない情報:
 
-- ``obs.hands[other_player]`` (riichienv 仕様上、他家 slot は空 list で
+- ``obs.hands`` の他家 slot (riichienv 仕様上、他家 slot は空 list で
   来るがガードとして touch しない)
 - ``env.hands`` / ``env.wall`` / ``env.state`` (engine 内部 hidden state)
 - 山 / 裏ドラ / future draw
@@ -35,6 +35,8 @@ from mahjong_agent.actions.types import (
     ModelAction,
     tile_id_to_type,
 )
+from mahjong_agent.baseline.shanten import compute_shanten
+from mahjong_agent.baseline.ukeire import count_acceptance
 from mahjong_agent.encoders.metadata import EncoderMetadata
 
 # tile_type / family vocab
@@ -48,7 +50,7 @@ _NUM_REL_SEATS_PLUS_NONE = _NUM_PLAYERS + 1  # 4 seats + 1 for "none"
 # ---------------------------------------------------------------------------
 # observation feature layout (decided once; metadata exposes ranges)
 #
-# layout (順):
+# v1 (base) layout:
 #   self_hand_counts        : 34
 #   self_meld_counts        : 34
 #   self_open_meld_flag     :  1
@@ -69,33 +71,80 @@ _NUM_REL_SEATS_PLUS_NONE = _NUM_PLAYERS + 1  # 4 seats + 1 for "none"
 #   round_wind_one_hot      :  4
 #   honba_norm              :  1
 #   riichi_sticks_norm      :  1
+#
+# v2 hints (enable_hints=True, default):
+#   current_shanten_norm        :  1  (shanten / 8, clamp [-1/8, 1])
+#   shanten_delta_per_discard   : 34  (per-tile_type の打牌後 shanten 変化 / 4)
+#   discard_ukeire_per_tile     : 34  (per-tile_type の打牌後 ukeire / 64)
+#   remaining_draws_norm        :  1  (山残り tiles / 70)
+#   turn_progress_norm          :  1  (sum(all discards) / 70)
+#   tile_presence_flags         :  6
+#       has_honor / has_terminal / has_simple / has_man / has_pin / has_sou
+#
+# Note: 旧仕様にあった ``riichi_discard_mask`` (34 dim) は、Stage03 で使う
+# PyPI ``riichienv`` の ``ActionType.RIICHI`` が ``.tile = None`` を返すため
+# 常に all-zero になっていた (dead feature)。Stage03 では Riichi 候補の
+# tile_type は ``ModelAction``/``LegalActionSet`` 経路で ``env.clone()`` +
+# Riichi step 経由で正確に生成しているので、encoder からは削除した。
 # ---------------------------------------------------------------------------
 
+_BASE_SPEC: tuple[tuple[str, int], ...] = (
+    ("self_hand_counts", _NUM_TILE_TYPES),
+    ("self_meld_counts", _NUM_TILE_TYPES),
+    ("self_open_meld_flag", 1),
+    ("self_riichi_flag", 1),
+    ("self_tenpai_flag", 1),
+    ("discards_self", _NUM_TILE_TYPES),
+    ("discards_shimo", _NUM_TILE_TYPES),
+    ("discards_toimen", _NUM_TILE_TYPES),
+    ("discards_kamicha", _NUM_TILE_TYPES),
+    ("melds_shimo", _NUM_TILE_TYPES),
+    ("melds_toimen", _NUM_TILE_TYPES),
+    ("melds_kamicha", _NUM_TILE_TYPES),
+    ("open_meld_flag_opp", _NUM_OPPONENTS),
+    ("riichi_flag_opp", _NUM_OPPONENTS),
+    ("dora_counts", _NUM_TILE_TYPES),
+    ("scores_normalized", _NUM_PLAYERS),
+    ("oya_rel_one_hot", _NUM_PLAYERS),
+    ("round_wind_one_hot", 4),
+    ("honba_norm", 1),
+    ("riichi_sticks_norm", 1),
+)
 
-def _build_observation_layout() -> tuple[int, dict[str, tuple[int, int]]]:
+_HINT_SPEC: tuple[tuple[str, int], ...] = (
+    ("current_shanten_norm", 1),
+    ("shanten_delta_per_discard", _NUM_TILE_TYPES),
+    ("discard_ukeire_per_tile", _NUM_TILE_TYPES),
+    ("remaining_draws_norm", 1),
+    ("turn_progress_norm", 1),
+    ("tile_presence_flags", 6),
+)
+
+# tile_presence_flags の内訳 (固定順)
+_TILE_PRESENCE_NAMES: tuple[str, ...] = (
+    "has_honor",
+    "has_terminal",
+    "has_simple",
+    "has_man",
+    "has_pin",
+    "has_sou",
+)
+
+# 最大ツモ可能枚数 (4 人麻雀: 136 - 14 dead wall - 13*4 配牌 = 70)
+_MAX_DRAWS_PER_KYOKU: int = 70
+# shanten clamping / normalization
+_SHANTEN_MAX: int = 8
+# ukeire 正規化 denom
+_UKEIRE_DENOM: float = 64.0
+
+
+def _build_observation_layout(
+    enable_hints: bool,
+) -> tuple[int, dict[str, tuple[int, int]]]:
     """observation feature の dim と feature_ranges を組み立てる。"""
-    spec: list[tuple[str, int]] = [
-        ("self_hand_counts", _NUM_TILE_TYPES),
-        ("self_meld_counts", _NUM_TILE_TYPES),
-        ("self_open_meld_flag", 1),
-        ("self_riichi_flag", 1),
-        ("self_tenpai_flag", 1),
-        ("discards_self", _NUM_TILE_TYPES),
-        ("discards_shimo", _NUM_TILE_TYPES),
-        ("discards_toimen", _NUM_TILE_TYPES),
-        ("discards_kamicha", _NUM_TILE_TYPES),
-        ("melds_shimo", _NUM_TILE_TYPES),
-        ("melds_toimen", _NUM_TILE_TYPES),
-        ("melds_kamicha", _NUM_TILE_TYPES),
-        ("open_meld_flag_opp", _NUM_OPPONENTS),
-        ("riichi_flag_opp", _NUM_OPPONENTS),
-        ("dora_counts", _NUM_TILE_TYPES),
-        ("scores_normalized", _NUM_PLAYERS),
-        ("oya_rel_one_hot", _NUM_PLAYERS),
-        ("round_wind_one_hot", 4),
-        ("honba_norm", 1),
-        ("riichi_sticks_norm", 1),
-    ]
+    spec: list[tuple[str, int]] = list(_BASE_SPEC)
+    if enable_hints:
+        spec.extend(_HINT_SPEC)
     ranges: dict[str, tuple[int, int]] = {}
     cursor = 0
     for name, dim in spec:
@@ -121,7 +170,8 @@ def _build_candidate_layout() -> tuple[int, dict[str, tuple[int, int]]]:
     return cursor, ranges
 
 
-_OBS_DIM, _OBS_RANGES = _build_observation_layout()
+_OBS_DIM_NO_HINTS, _OBS_RANGES_NO_HINTS = _build_observation_layout(False)
+_OBS_DIM_WITH_HINTS, _OBS_RANGES_WITH_HINTS = _build_observation_layout(True)
 _CAND_DIM, _CAND_RANGES = _build_candidate_layout()
 
 
@@ -164,13 +214,23 @@ def _opponent_rel_seat_order(num_players: int, player_id: int) -> list[int]:
 
 
 class PublicObservationEncoder:
-    """Public-only observation / candidate / legal-mask encoder (v1).
+    """Public-only observation / candidate / legal-mask encoder (v2)。
 
-    Output は np.float32 で固定長。``metadata()`` で各部分の dim / 範囲を
-    取得できる。
+    ``enable_hints=True`` (default) で shanten / ukeire / riichi-discard-mask
+    / 残り山 / 牌種分布 等の public hint feature を追加する。off にすると
+    base layout のみで legacy compat 互換動作。
+
+    Output は np.float32 固定長。``metadata()`` で各 feature の range を
+    返す。``Stage03ModelConfig.from_encoder_metadata(encoder.metadata())``
+    で model の input dim が自動追従する。
     """
 
-    def __init__(self, num_players: int = _NUM_PLAYERS):
+    def __init__(
+        self,
+        num_players: int = _NUM_PLAYERS,
+        *,
+        enable_hints: bool = True,
+    ):
         if num_players != _NUM_PLAYERS:
             # 3 人麻雀の場合 layout が変わるが、v1 は 4 人麻雀のみ対応。
             raise NotImplementedError(
@@ -178,6 +238,21 @@ class PublicObservationEncoder:
                 f"(got num_players={num_players})"
             )
         self._num_players = num_players
+        self._enable_hints = bool(enable_hints)
+        if self._enable_hints:
+            self._obs_dim = _OBS_DIM_WITH_HINTS
+            self._obs_ranges = _OBS_RANGES_WITH_HINTS
+        else:
+            self._obs_dim = _OBS_DIM_NO_HINTS
+            self._obs_ranges = _OBS_RANGES_NO_HINTS
+
+    @property
+    def enable_hints(self) -> bool:
+        return self._enable_hints
+
+    @property
+    def observation_dim(self) -> int:
+        return self._obs_dim
 
     # ------------------------------------------------------------------
     # metadata
@@ -185,10 +260,10 @@ class PublicObservationEncoder:
 
     def metadata(self) -> EncoderMetadata:
         return EncoderMetadata(
-            observation_dim=_OBS_DIM,
+            observation_dim=self._obs_dim,
             candidate_dim=_CAND_DIM,
             discard_mask_dim=_NUM_TILE_TYPES,
-            feature_ranges=dict(_OBS_RANGES),
+            feature_ranges=dict(self._obs_ranges),
             candidate_feature_ranges=dict(_CAND_RANGES),
         )
 
@@ -202,14 +277,14 @@ class PublicObservationEncoder:
         Hidden information (他家手牌 / 山 / engine internal full state) は
         参照しない。``obs.hands`` の他家 slot (= 仕様上空 list) も touch しない。
         """
-        feat = np.zeros(_OBS_DIM, dtype=np.float32)
+        feat = np.zeros(self._obs_dim, dtype=np.float32)
         player_id = int(obs.player_id)
         num_players = self._num_players
         opp_order = _opponent_rel_seat_order(num_players, player_id)
 
         # self hand
         self_hand_counts = _tile_id_list_to_counts(obs.hand)
-        _set_range(feat, _OBS_RANGES, "self_hand_counts", self_hand_counts)
+        _set_range(feat, self._obs_ranges, "self_hand_counts", self_hand_counts)
 
         # self meld counts + open meld flag
         self_melds = obs.melds[player_id] if obs.melds else []
@@ -219,25 +294,25 @@ class PublicObservationEncoder:
             self_meld_counts += _tile_id_list_to_counts(_meld_tile_ids(meld))
             if _meld_is_open(meld):
                 self_has_open_meld = 1.0
-        _set_range(feat, _OBS_RANGES, "self_meld_counts", self_meld_counts)
-        _set_range(feat, _OBS_RANGES, "self_open_meld_flag",
+        _set_range(feat, self._obs_ranges, "self_meld_counts", self_meld_counts)
+        _set_range(feat, self._obs_ranges, "self_open_meld_flag",
                    np.array([self_has_open_meld], dtype=np.float32))
 
         # self riichi flag + tenpai flag
         self_riichi = 1.0 if obs.riichi_declared[player_id] else 0.0
-        _set_range(feat, _OBS_RANGES, "self_riichi_flag",
+        _set_range(feat, self._obs_ranges, "self_riichi_flag",
                    np.array([self_riichi], dtype=np.float32))
         self_tenpai = 1.0 if obs.is_tenpai else 0.0
-        _set_range(feat, _OBS_RANGES, "self_tenpai_flag",
+        _set_range(feat, self._obs_ranges, "self_tenpai_flag",
                    np.array([self_tenpai], dtype=np.float32))
 
         # discards (self / shimo / toimen / kamicha)
-        _set_range(feat, _OBS_RANGES, "discards_self",
+        _set_range(feat, self._obs_ranges, "discards_self",
                    _tile_id_list_to_counts(obs.discards[player_id]))
         for rel_idx, opp_pid in enumerate(opp_order, start=1):
             name = {1: "discards_shimo", 2: "discards_toimen",
                     3: "discards_kamicha"}[rel_idx]
-            _set_range(feat, _OBS_RANGES, name,
+            _set_range(feat, self._obs_ranges, name,
                        _tile_id_list_to_counts(obs.discards[opp_pid]))
 
         # opponent melds + flags
@@ -252,14 +327,14 @@ class PublicObservationEncoder:
                 opp_meld_counts += _tile_id_list_to_counts(_meld_tile_ids(meld))
                 if _meld_is_open(meld):
                     open_meld_opp[rel_idx - 1] = 1.0
-            _set_range(feat, _OBS_RANGES, name, opp_meld_counts)
+            _set_range(feat, self._obs_ranges, name, opp_meld_counts)
             if obs.riichi_declared[opp_pid]:
                 riichi_opp[rel_idx - 1] = 1.0
-        _set_range(feat, _OBS_RANGES, "open_meld_flag_opp", open_meld_opp)
-        _set_range(feat, _OBS_RANGES, "riichi_flag_opp", riichi_opp)
+        _set_range(feat, self._obs_ranges, "open_meld_flag_opp", open_meld_opp)
+        _set_range(feat, self._obs_ranges, "riichi_flag_opp", riichi_opp)
 
         # dora indicators
-        _set_range(feat, _OBS_RANGES, "dora_counts",
+        _set_range(feat, self._obs_ranges, "dora_counts",
                    _tile_id_list_to_counts(obs.dora_indicators))
 
         # scores (self / shimo / toimen / kamicha 順、100k で正規化)
@@ -267,28 +342,113 @@ class PublicObservationEncoder:
         scores_rel[0] = float(obs.scores[player_id]) / 100_000.0
         for rel_idx, opp_pid in enumerate(opp_order, start=1):
             scores_rel[rel_idx] = float(obs.scores[opp_pid]) / 100_000.0
-        _set_range(feat, _OBS_RANGES, "scores_normalized", scores_rel)
+        _set_range(feat, self._obs_ranges, "scores_normalized", scores_rel)
 
         # oya: self-relative one-hot
         oya_rel = (int(obs.oya) - player_id) % num_players
         oya_one_hot = np.zeros(num_players, dtype=np.float32)
         oya_one_hot[oya_rel] = 1.0
-        _set_range(feat, _OBS_RANGES, "oya_rel_one_hot", oya_one_hot)
+        _set_range(feat, self._obs_ranges, "oya_rel_one_hot", oya_one_hot)
 
         # round wind one-hot
         wind = int(obs.round_wind)
         wind_one_hot = np.zeros(4, dtype=np.float32)
         if 0 <= wind < 4:
             wind_one_hot[wind] = 1.0
-        _set_range(feat, _OBS_RANGES, "round_wind_one_hot", wind_one_hot)
+        _set_range(feat, self._obs_ranges, "round_wind_one_hot", wind_one_hot)
 
         # honba + riichi sticks (norm)
-        _set_range(feat, _OBS_RANGES, "honba_norm",
+        _set_range(feat, self._obs_ranges, "honba_norm",
                    np.array([float(obs.honba) / 10.0], dtype=np.float32))
-        _set_range(feat, _OBS_RANGES, "riichi_sticks_norm",
+        _set_range(feat, self._obs_ranges, "riichi_sticks_norm",
                    np.array([float(obs.riichi_sticks) / 4.0], dtype=np.float32))
 
+        if self._enable_hints:
+            self._encode_hints(
+                feat, obs, self_hand_counts, self_melds,
+            )
+
         return feat
+
+    # ------------------------------------------------------------------
+    # v2 hint features
+    # ------------------------------------------------------------------
+
+    def _encode_hints(
+        self,
+        feat: np.ndarray,
+        obs: Any,
+        self_hand_counts: np.ndarray,
+        self_melds: list,
+    ) -> None:
+        """v2 hint features を ``feat`` の対応 range に書き込む (in-place)。
+
+        hidden info を一切使わず、``obs.hand`` (自手) と ``obs.legal_actions()``
+        (公開された legal mask) と ``obs.discards`` (公開河) のみを参照する。
+        """
+        # 自手 counts (int list 化)
+        hand_counts_list = [int(x) for x in self_hand_counts.tolist()]
+        meld_count = len(self_melds)
+        # 1) current shanten
+        try:
+            current_shanten = compute_shanten(hand_counts_list, meld_count)
+        except ValueError:
+            current_shanten = _SHANTEN_MAX
+        _set_range(
+            feat, self._obs_ranges, "current_shanten_norm",
+            np.array([float(current_shanten) / float(_SHANTEN_MAX)],
+                     dtype=np.float32),
+        )
+
+        # 2) shanten_delta_per_discard / 3) discard_ukeire_per_tile
+        shanten_delta = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+        ukeire_per_tile = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+        for t in range(_NUM_TILE_TYPES):
+            if hand_counts_list[t] <= 0:
+                continue
+            hand_counts_list[t] -= 1
+            try:
+                sh_after = compute_shanten(hand_counts_list, meld_count)
+                acc = count_acceptance(hand_counts_list, sh_after, meld_count)
+            except ValueError:
+                sh_after = current_shanten
+                acc = 0
+            hand_counts_list[t] += 1
+            # delta > 0 ⇒ 打牌すると shanten が下がる (= 良い)。/4 で正規化、
+            # [-1, 1] にクランプ。
+            d = current_shanten - sh_after
+            shanten_delta[t] = max(-1.0, min(1.0, float(d) / 4.0))
+            ukeire_per_tile[t] = min(
+                1.0, float(acc) / _UKEIRE_DENOM
+            )
+        _set_range(feat, self._obs_ranges, "shanten_delta_per_discard", shanten_delta)
+        _set_range(feat, self._obs_ranges, "discard_ukeire_per_tile", ukeire_per_tile)
+
+        # 4) remaining_draws_norm / 5) turn_progress_norm
+        # 公開河の枚数合計から残り山を概算する。
+        total_discarded = 0
+        for d in obs.discards if obs.discards else []:
+            total_discarded += len(d)
+        remaining = max(0, _MAX_DRAWS_PER_KYOKU - total_discarded)
+        _set_range(
+            feat, self._obs_ranges, "remaining_draws_norm",
+            np.array(
+                [min(1.0, float(remaining) / float(_MAX_DRAWS_PER_KYOKU))],
+                dtype=np.float32,
+            ),
+        )
+        _set_range(
+            feat, self._obs_ranges, "turn_progress_norm",
+            np.array(
+                [min(1.0,
+                     float(total_discarded) / float(_MAX_DRAWS_PER_KYOKU))],
+                dtype=np.float32,
+            ),
+        )
+
+        # 6) tile_presence_flags
+        flags = _tile_presence_flags(hand_counts_list)
+        _set_range(feat, self._obs_ranges, "tile_presence_flags", flags)
 
     # ------------------------------------------------------------------
     # legal mask
@@ -409,6 +569,46 @@ _FAMILY_INDEX = {f: i for i, f in enumerate(_FAMILY_ORDER)}
 
 def _family_index(family: ActionFamily) -> int:
     return _FAMILY_INDEX[family]
+
+
+# tile_presence_flags 用の tile_type set 定義
+_HONOR_TT: tuple[int, ...] = tuple(range(27, 34))
+_TERMINAL_TT: tuple[int, ...] = (0, 8, 9, 17, 18, 26)
+_MAN_TT: tuple[int, ...] = tuple(range(0, 9))
+_PIN_TT: tuple[int, ...] = tuple(range(9, 18))
+_SOU_TT: tuple[int, ...] = tuple(range(18, 27))
+
+
+def _tile_presence_flags(counts: list[int]) -> np.ndarray:
+    """自手 counts から (6,) tile-presence flag を作る。
+
+    順: has_honor / has_terminal / has_simple / has_man / has_pin / has_sou。
+    """
+    has_honor = any(counts[t] > 0 for t in _HONOR_TT)
+    has_terminal = any(counts[t] > 0 for t in _TERMINAL_TT)
+    # has_simple = 数牌 2..8 が 1 枚でもある
+    has_simple = False
+    for suit_base in (0, 9, 18):
+        for offset in range(1, 8):
+            if counts[suit_base + offset] > 0:
+                has_simple = True
+                break
+        if has_simple:
+            break
+    has_man = any(counts[t] > 0 for t in _MAN_TT)
+    has_pin = any(counts[t] > 0 for t in _PIN_TT)
+    has_sou = any(counts[t] > 0 for t in _SOU_TT)
+    return np.array(
+        [
+            float(has_honor),
+            float(has_terminal),
+            float(has_simple),
+            float(has_man),
+            float(has_pin),
+            float(has_sou),
+        ],
+        dtype=np.float32,
+    )
 
 
 __all__ = ["PublicObservationEncoder"]
