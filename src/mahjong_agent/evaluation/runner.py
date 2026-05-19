@@ -37,6 +37,7 @@ from mahjong_agent.actions.resolver import resolve
 from mahjong_agent.actions.types import ActionFamily, LegalActionSet, ModelAction
 from mahjong_agent.data.types import DecisionSample
 from mahjong_agent.encoders.public_observation import PublicObservationEncoder
+from mahjong_agent.evaluation.replay_yaku import collect_round_yaku_records
 from mahjong_agent.evaluation.round_tracker import (
     RoundTracker,
     make_initial_sample,
@@ -300,14 +301,34 @@ class SelfPlayRunner:
 
         # finalize: 最後の mjai_log walk (game の終了時 end_kyoku も拾う)
         tracker.consume_mjai_events(list(env.mjai_log))
-        # game 終了時の terminated flag と final-round yaku/han/fu
+        # game 終了時の terminated flag と all-round yaku/han/fu
         tracker.mark_terminated()
-        try:
-            wr = dict(env.win_results) if not crash_ctx else {}
-        except Exception:  # noqa: BLE001
-            wr = {}
-        if wr:
-            tracker.finalize_game_with_win_results(wr)
+        # all-round yaku backfill: ``riichienv.MjaiReplay`` 経由で全 round の
+        # winner WinResultContext を取り出し、mid-game も含めて winner sample
+        # に yaku/han/fu を書き戻す。
+        replay_records: tuple[Any, ...] = ()
+        replay_failed = False
+        if not crash_ctx:
+            try:
+                replay_records = collect_round_yaku_records(list(env.mjai_log))
+            except Exception:  # noqa: BLE001
+                # mjai_log の partial / Replay 構築失敗時は silent に fallback。
+                replay_failed = True
+                replay_records = ()
+        if replay_records:
+            tracker.finalize_with_round_yaku_records(replay_records)
+        else:
+            # replay 失敗 / records 空のときは旧 path (final round の
+            # env.win_results) を fallback として使う。
+            try:
+                wr = dict(env.win_results) if not crash_ctx else {}
+            except Exception:  # noqa: BLE001
+                wr = {}
+            if wr:
+                tracker.finalize_game_with_win_results(wr)
+        # replay_failed は明示利用しないが、診断時の breakpoint 用に保持する
+        # (現状 EpisodeResult schema を増やさないため metadata には載せない)。
+        del replay_failed
         # scores / ranks
         try:
             final_scores = [int(s) for s in env.scores()]

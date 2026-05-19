@@ -17,20 +17,22 @@
   そこで ``env.mjai_log`` を walk して round-end events を取得し、そこから
   per-player score delta を取り出す方針を採る。
 - ``hora`` event は actor / target / tsumo / deltas を持つが、yaku / han / fu は
-  含まれない。v1 では yaku/han/fu は **game 最終 round の env.win_results からのみ**
-  取得する (mid-game の hora では yaku target = 全 0、yaku_loss_mask = 0 と
-  conservative に倒す)。詳細は ``finalize_game_with_win_results()`` 参照。
+  含まれない。通常は game 完走後に ``MjaiReplay`` で全 round の yaku/han/fu を
+  再計算し、``finalize_with_round_yaku_records()`` で winner samples に backfill
+  する。``finalize_game_with_win_results()`` は replay 失敗時の fallback として残す。
 - 流局の途中流局 (kyushu_kyuhai 等) は v1 では全 player を
   ``OTHER_NON_DEALIN`` に倒す。
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from mahjong_agent.data.types import SCHEMA_VERSION, DecisionSample
+from mahjong_agent.evaluation.replay_yaku import RoundYakuRecord
 from mahjong_agent.targets.terminal import (
     RoundOutcome,
     terminal_class_index,
@@ -354,6 +356,69 @@ class RoundTracker:
                 s.fu = fu
                 if s.round_over:
                     seen_round_over = True
+
+    def finalize_with_round_yaku_records(
+        self, records: Sequence[RoundYakuRecord]
+    ) -> int:
+        """post-game に再計算した ``RoundYakuRecord`` を winner samples に backfill する。
+
+        Parameters
+        ----------
+        records:
+            ``mahjong_agent.evaluation.replay_yaku.collect_round_yaku_records``
+            の戻り値。``round_index`` は ``MjaiReplay.take_kyokus()`` の順、
+            ``winner_seat`` は和了した player の seat id。
+
+        Returns
+        -------
+        int:
+            backfill が反映された **distinct な (round_idx, player_id) ペア** の数。
+            diagnostics / regression 用。
+
+        Notes
+        -----
+        - mid-game / final round の区別なく、全 hora round の winner sample
+          に ``yaku_target`` / ``yaku_loss_mask=1.0`` / ``han`` / ``fu`` を
+          書き込む。``finalize_game_with_win_results`` は fallback として残す。
+        - 同 round 複数 winner (double-ron 等) は record が複数返るため、
+          各 winner ごとに backfill する。
+        - 該当 winner sample が見つからない (= その round / seat には sample が
+          存在しない config の場合など) ときは crash せずスキップする。
+        - score_delta / reward / terminal_class / round_over は本関数では
+          変更しない (round-end backfill 経路で確定済み)。
+        """
+        if not records:
+            return 0
+        # (round_idx -> player_id -> sample indices) の index を 1 回作る。
+        per_round_player_indices: dict[int, dict[int, list[int]]] = {}
+        for i, s in enumerate(self.samples):
+            per_round_player_indices.setdefault(
+                int(getattr(s, "round_id", 0)), {}
+            ).setdefault(int(s.player_id), []).append(i)
+
+        applied_pairs: set[tuple[int, int]] = set()
+        for rec in records:
+            pid = int(rec.winner_seat)
+            ridx = int(rec.round_index)
+            round_map = per_round_player_indices.get(ridx)
+            if not round_map:
+                continue
+            sample_indices = round_map.get(pid)
+            if not sample_indices:
+                continue
+            target, mask = extract_yaku_target(
+                list(rec.yaku_ids), is_winner=True, allow_unknown=True
+            )
+            han = int(rec.han)
+            fu = int(rec.fu)
+            for idx in sample_indices:
+                s = self.samples[idx]
+                s.yaku_target = target.copy()
+                s.yaku_loss_mask = float(mask)
+                s.han = han
+                s.fu = fu
+            applied_pairs.add((ridx, pid))
+        return len(applied_pairs)
 
     def mark_terminated(self) -> None:
         """game 終了時に、各 player の最後の sample に ``terminated=True`` を立てる。"""
