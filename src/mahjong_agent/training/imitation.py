@@ -29,6 +29,11 @@ from mahjong_agent.actions.types import ActionFamily
 from mahjong_agent.data.collate import collate_decision_samples
 from mahjong_agent.data.types import DecisionBatch, DecisionSample
 from mahjong_agent.models.stage03_model import Stage03Model
+from mahjong_agent.training.optimizer_groups import (
+    LRGroupConfig,
+    build_lr_grouped_optimizer,
+)
+from mahjong_agent.training.sample_weighting import compute_per_player_round_weights
 
 # ---------------------------------------------------------------------------
 # Config / metrics dataclasses
@@ -80,6 +85,20 @@ class ImitationConfig:
     device: str = "cpu"
     shuffle: bool = True
     seed: int | None = None
+    # Stage02 由来の stabilizer (opt-in)。default off で旧挙動互換。
+    lr_group_config: LRGroupConfig | None = None
+    """policy / value_semantic / trunk lr 分離。``None`` で single group。"""
+    exclude_post_riichi_discards: bool = False
+    """``DecisionSample.metadata["is_post_riichi_discard"]==True`` の discard
+    sample を loss / accuracy 集計から除外する (Stage02 CQ-0164 移植)。
+    default off。candidate / terminal / yaku branch には影響しない。"""
+    per_player_round_weighting: bool = False
+    """同一 ``(episode_id, round_id, player_id)`` の sample 重み合計が 1.0
+    になるよう normalize する。discard / candidate / terminal / yaku の全
+    branch loss に乗算で効く。default off。
+
+    weight は **minibatch-local** (= collate された 1 batch 内の sample で
+    正規化) に計算する。PPO 側も同じ minibatch-local semantics に揃えてある。"""
     # tie-aware imitation
     tie_aware_discard: bool = False
     """discard loss の target を ``teacher_best_mask`` (multi-hot) で扱う。
@@ -135,6 +154,9 @@ class ImitationMetrics:
     accuracy_terminal: float = 0.0
     accuracy_yaku_micro: float = 0.0
     grad_norm: float = 0.0
+    post_riichi_excluded_count: int = 0
+    """``exclude_post_riichi_discards`` で discard branch から除外した sample 数。
+    flag off では常に 0。"""
 
     def to_dict(self) -> dict[str, Any]:
         """JSON serializable dict を返す。"""
@@ -156,6 +178,7 @@ class ImitationMetrics:
             "accuracy_terminal": float(self.accuracy_terminal),
             "accuracy_yaku_micro": float(self.accuracy_yaku_micro),
             "grad_norm": float(self.grad_norm),
+            "post_riichi_excluded_count": int(self.post_riichi_excluded_count),
         }
 
 
@@ -171,6 +194,20 @@ _LARGE_NEG: float = -1.0e9
 def _zero_loss(device: torch.device) -> torch.Tensor:
     """0.0 scalar tensor (requires_grad=False)。empty branch 用。"""
     return torch.zeros((), dtype=torch.float32, device=device)
+
+
+def _weighted_mean(
+    per_sample_loss: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """``per_sample_loss`` を ``weights`` で重み付き平均する。
+
+    両者は同 length 1D tensor。``weights.sum() == 0`` の極端ケースでも
+    backward に支障が無いよう小さな ``clamp_min`` で割る。
+    """
+    w = weights.clamp_min(0.0)
+    denom = w.sum().clamp_min(1e-8)
+    return (per_sample_loss * w).sum() / denom
 
 
 def _move_tensor(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -249,6 +286,27 @@ def compute_imitation_loss(
     yaku_target = _move_tensor(batch.yaku_target, device).float()
     yaku_loss_mask = _move_tensor(batch.yaku_loss_mask, device).float()
     teacher_best_mask = _move_tensor(batch.teacher_best_mask, device).float()
+    # Stage02 stabilizer: post-riichi sample 検出 (discard branch のみ除外)。
+    is_post_riichi = torch.tensor(
+        [
+            bool((md or {}).get("is_post_riichi_discard", False))
+            for md in batch.metadata
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    # per-(episode, round, player) weighting (default 全 1.0)。
+    # minibatch-local: collate 済みの 1 batch 内 sample でのみ正規化する
+    # (PPO 側も _iter_minibatches で同じ minibatch-local 計算に統一)。
+    if bool(config.per_player_round_weighting):
+        weight_np = compute_per_player_round_weights(
+            episode_ids=batch.episode_id,
+            round_ids=[int(x) for x in batch.round_id.tolist()],
+            player_ids=[int(x) for x in batch.player_id.tolist()],
+        )
+        sample_weight = torch.from_numpy(weight_np).to(device)
+    else:
+        sample_weight = torch.ones(n, dtype=torch.float32, device=device)
 
     # forward (4 heads)
     fwd = model(obs, discard_mask=discard_mask)
@@ -262,14 +320,21 @@ def compute_imitation_loss(
         dtype=torch.bool,
         device=device,
     )
-    discard_valid_idx = (is_normal_discard & (sel_disc >= 0)).nonzero(
-        as_tuple=False
-    ).flatten()
+    discard_mask_valid = is_normal_discard & (sel_disc >= 0)
+    # Stage02 stabilizer: post-riichi 強制 tsumogiri を除外 (opt-in)。
+    post_riichi_excluded_count = 0
+    if bool(config.exclude_post_riichi_discards):
+        excluded = discard_mask_valid & is_post_riichi
+        post_riichi_excluded_count = int(excluded.sum().item())
+        discard_mask_valid = discard_mask_valid & (~is_post_riichi)
+    discard_valid_idx = discard_mask_valid.nonzero(as_tuple=False).flatten()
     discard_count = int(discard_valid_idx.numel())
     discard_correct = 0
+    use_weighting = bool(config.per_player_round_weighting)
     if discard_count > 0:
         d_logits = fwd.discard_logits[discard_valid_idx]
         d_targets = sel_disc[discard_valid_idx]
+        d_weights = sample_weight[discard_valid_idx]
         if config.tie_aware_discard:
             d_masks = teacher_best_mask[discard_valid_idx]  # (M, 34)
             has_best = d_masks.sum(dim=-1) > 0  # (M,) bool
@@ -299,7 +364,10 @@ def compute_imitation_loss(
                     d_logits[idx_hard], tgts_hard, reduction="none"
                 )
                 losses[idx_hard] = hard_loss
-            discard_loss = losses.mean()
+            if use_weighting:
+                discard_loss = _weighted_mean(losses, d_weights)
+            else:
+                discard_loss = losses.mean()
             with torch.no_grad():
                 # tie-aware accuracy: best_mask を持つ sample では
                 # argmax が best_set 内のどれかに当たれば correct、
@@ -320,7 +388,11 @@ def compute_imitation_loss(
                     correct |= ((~has_best) & (argmax_idx == d_targets))
                 discard_correct = int(correct.sum().item())
         else:
-            discard_loss = F.cross_entropy(d_logits, d_targets, reduction="mean")
+            per_sample = F.cross_entropy(d_logits, d_targets, reduction="none")
+            if use_weighting:
+                discard_loss = _weighted_mean(per_sample, d_weights)
+            else:
+                discard_loss = per_sample.mean()
             with torch.no_grad():
                 discard_correct = int(
                     (d_logits.argmax(dim=-1) == d_targets).sum().item()
@@ -349,7 +421,12 @@ def compute_imitation_loss(
             cmask = cand_mask[candidate_valid_idx]     # (M, Cmax)
             masked = scores + (1.0 - cmask) * _LARGE_NEG
             tgt = sel_cand[candidate_valid_idx]
-            candidate_loss = F.cross_entropy(masked, tgt, reduction="mean")
+            per_sample_cand = F.cross_entropy(masked, tgt, reduction="none")
+            if use_weighting:
+                cand_weights = sample_weight[candidate_valid_idx]
+                candidate_loss = _weighted_mean(per_sample_cand, cand_weights)
+            else:
+                candidate_loss = per_sample_cand.mean()
             with torch.no_grad():
                 candidate_correct = int(
                     (masked.argmax(dim=-1) == tgt).sum().item()
@@ -366,7 +443,12 @@ def compute_imitation_loss(
     if terminal_count > 0:
         t_logits = fwd.terminal_logits[terminal_valid_idx]
         t_target = terminal_class[terminal_valid_idx]
-        terminal_loss = F.cross_entropy(t_logits, t_target, reduction="mean")
+        per_sample_term = F.cross_entropy(t_logits, t_target, reduction="none")
+        if use_weighting:
+            t_weights = sample_weight[terminal_valid_idx]
+            terminal_loss = _weighted_mean(per_sample_term, t_weights)
+        else:
+            terminal_loss = per_sample_term.mean()
         with torch.no_grad():
             terminal_correct = int(
                 (t_logits.argmax(dim=-1) == t_target).sum().item()
@@ -382,9 +464,14 @@ def compute_imitation_loss(
     if yaku_count > 0:
         y_logits = fwd.yaku_logits[yaku_valid_idx]
         y_target = yaku_target[yaku_valid_idx]
-        yaku_loss = F.binary_cross_entropy_with_logits(
-            y_logits, y_target, reduction="mean"
-        )
+        per_sample_yaku = F.binary_cross_entropy_with_logits(
+            y_logits, y_target, reduction="none"
+        ).mean(dim=-1)  # per-sample average over yaku dim
+        if use_weighting:
+            y_weights = sample_weight[yaku_valid_idx]
+            yaku_loss = _weighted_mean(per_sample_yaku, y_weights)
+        else:
+            yaku_loss = per_sample_yaku.mean()
         with torch.no_grad():
             pred = (torch.sigmoid(y_logits) > 0.5).float()
             yaku_micro_correct = int((pred == y_target).sum().item())
@@ -432,6 +519,7 @@ def compute_imitation_loss(
             else 0.0
         ),
         grad_norm=0.0,
+        post_riichi_excluded_count=post_riichi_excluded_count,
     )
     return total_loss, metrics
 
@@ -444,11 +532,31 @@ def compute_imitation_loss(
 def make_default_optimizer(
     model: nn.Module, config: ImitationConfig
 ) -> optim.Optimizer:
-    """AdamW を ``ImitationConfig`` 設定で作る convenience。"""
-    return optim.AdamW(
-        model.parameters(),
-        lr=float(config.learning_rate),
-        weight_decay=float(config.weight_decay),
+    """AdamW を ``ImitationConfig`` 設定で作る convenience。
+
+    ``config.lr_group_config.enabled=True`` のときは Stage02 由来の lr group
+    分離を適用する (= policy / value_semantic / trunk / default の 4 group)。
+    """
+    opt, _info = build_lr_grouped_optimizer(
+        model,
+        base_lr=float(config.learning_rate),
+        base_weight_decay=float(config.weight_decay),
+        lr_group_config=config.lr_group_config,
+        optimizer_cls=optim.AdamW,
+    )
+    return opt
+
+
+def make_imitation_optimizer_with_info(
+    model: nn.Module, config: ImitationConfig
+) -> tuple[optim.Optimizer, dict[str, Any]]:
+    """``make_default_optimizer`` と同等だが、lr group diagnostics 情報も返す。"""
+    return build_lr_grouped_optimizer(
+        model,
+        base_lr=float(config.learning_rate),
+        base_weight_decay=float(config.weight_decay),
+        lr_group_config=config.lr_group_config,
+        optimizer_cls=optim.AdamW,
     )
 
 
@@ -551,6 +659,9 @@ def _aggregate_epoch_metrics(
         accuracy_terminal=float(accuracy_terminal),
         accuracy_yaku_micro=float(accuracy_yaku_micro),
         grad_norm=float(grad_norm_avg),
+        post_riichi_excluded_count=sum(
+            int(m.post_riichi_excluded_count) for m in batch_metrics
+        ),
     )
 
 
@@ -656,6 +767,7 @@ def _with_grad_norm(
         accuracy_terminal=metrics.accuracy_terminal,
         accuracy_yaku_micro=metrics.accuracy_yaku_micro,
         grad_norm=float(grad_norm),
+        post_riichi_excluded_count=metrics.post_riichi_excluded_count,
     )
 
 
@@ -737,9 +849,11 @@ __all__ = [
     "ImitationConfig",
     "ImitationMetrics",
     "ImitationRunResult",
+    "LRGroupConfig",
     "compute_imitation_loss",
     "train_imitation_epoch",
     "fit_imitation",
     "make_default_optimizer",
+    "make_imitation_optimizer_with_info",
     "metrics_to_json",
 ]

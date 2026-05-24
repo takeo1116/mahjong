@@ -599,6 +599,19 @@ class SelfPlayRunner:
         # この flag を見て eligible=False に倒す。
         if bool(extras.get("ppo_exclude", False)):
             metadata["ppo_exclude"] = True
+        # post-riichi discard 検出: NORMAL_DISCARD かつ player が既に riichi
+        # 宣言済みのとき、env 側で行動が強制 (tsumogiri only) されており、
+        # 学習対象として除外したい場合がある。trainer 側 opt-in flag で
+        # 除外できるよう metadata に sticky flag を入れる (実 sample が
+        # post-riichi かどうかは観測時の obs.riichi_declared から決まる)。
+        if family == ActionFamily.NORMAL_DISCARD:
+            riichi_declared = getattr(obs, "riichi_declared", None)
+            if (
+                riichi_declared is not None
+                and 0 <= int(player_id) < len(riichi_declared)
+                and bool(riichi_declared[int(player_id)])
+            ):
+                metadata["is_post_riichi_discard"] = True
         return make_initial_sample(
             episode_id=episode_id,
             round_idx=round_idx,

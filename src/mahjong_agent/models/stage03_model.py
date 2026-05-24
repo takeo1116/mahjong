@@ -9,9 +9,10 @@ Heads:
 - terminal auxiliary head (5-class)
 - yaku auxiliary head (49-class multi-label)
 
-すべての head は public-only の shared trunk から分岐する。v1 では semantic
-summary を policy 経路に押し込まない (= terminal / yaku auxiliary は value
-side で別 head として学ぶだけ)。
+すべての head は public-only の shared trunk から分岐する。default では
+semantic summary を policy 経路に押し込まない (= terminal / yaku auxiliary は
+value side で別 head として学ぶだけ)。Stage02 parity 用に、terminal / yaku
+出力を detach して policy 経路へ戻す opt-in 経路も持つ。
 """
 from __future__ import annotations
 
@@ -59,6 +60,17 @@ class Stage03ModelConfig:
         yaku auxiliary head の出力 class 数。default ``NUM_YAKU`` (= 49)。
     num_tile_types:
         discard head の出力 dim。default 34。
+    semantic_summary_in_policy:
+        ``False`` (default) で旧 architecture と完全互換。``True`` のとき、
+        terminal head と yaku head の出力から作った detached summary feature
+        を discard head / candidate scorer の入力に追加する (Stage02
+        semantic auxiliary injection の Stage03 移植)。policy 経路に流す際は
+        必ず detach する (= summary は terminal/yaku loss だけで学ぶ)。
+        既存 checkpoint との互換性を壊さないため default は False。
+    semantic_summary_detach:
+        ``True`` (default, 推奨)。``False`` は debugging 用で、summary に
+        gradient を逆流させる (Stage02 知見に反するので production では
+        使わない)。
     """
 
     observation_dim: int
@@ -70,6 +82,8 @@ class Stage03ModelConfig:
     num_terminal_classes: int = NUM_TERMINAL_CLASSES
     num_yaku: int = NUM_YAKU
     num_tile_types: int = _NUM_TILE_TYPES
+    semantic_summary_in_policy: bool = False
+    semantic_summary_detach: bool = True
 
     @classmethod
     def from_encoder_metadata(
@@ -80,6 +94,8 @@ class Stage03ModelConfig:
         trunk_layers: int = 2,
         candidate_hidden_dim: int = 128,
         dropout: float = 0.0,
+        semantic_summary_in_policy: bool = False,
+        semantic_summary_detach: bool = True,
     ) -> Stage03ModelConfig:
         """``EncoderMetadata`` から observation_dim / candidate_dim を引き継いで config を作る。"""
         return cls(
@@ -89,6 +105,8 @@ class Stage03ModelConfig:
             trunk_layers=int(trunk_layers),
             candidate_hidden_dim=int(candidate_hidden_dim),
             dropout=float(dropout),
+            semantic_summary_in_policy=bool(semantic_summary_in_policy),
+            semantic_summary_detach=bool(semantic_summary_detach),
         )
 
 
@@ -184,8 +202,6 @@ class Stage03Model(nn.Module):
             num_layers=config.trunk_layers,
             dropout=config.dropout,
         )
-        # discard head
-        self.discard_head = nn.Linear(config.hidden_dim, config.num_tile_types)
         # value head (scalar -> squeeze)
         self.value_head = nn.Linear(config.hidden_dim, 1)
         # terminal auxiliary head
@@ -194,8 +210,21 @@ class Stage03Model(nn.Module):
         )
         # yaku auxiliary head
         self.yaku_head = nn.Linear(config.hidden_dim, config.num_yaku)
-        # candidate scorer MLP: input = trunk hidden + candidate feature
-        scorer_in = config.hidden_dim + config.candidate_dim
+        # semantic summary を policy に流すかどうかで discard / candidate head
+        # の入力 dim が変わる。default off では従来 architecture と一致する。
+        if config.semantic_summary_in_policy:
+            self._semantic_summary_dim = int(
+                config.num_terminal_classes + config.num_yaku
+            )
+        else:
+            self._semantic_summary_dim = 0
+        discard_in = config.hidden_dim + self._semantic_summary_dim
+        self.discard_head = nn.Linear(discard_in, config.num_tile_types)
+        # candidate scorer MLP: input = trunk hidden + semantic summary (opt) +
+        # candidate feature。
+        scorer_in = (
+            config.hidden_dim + self._semantic_summary_dim + config.candidate_dim
+        )
         scorer_layers: list[nn.Module] = [
             nn.Linear(scorer_in, config.candidate_hidden_dim),
             nn.ReLU(),
@@ -243,12 +272,15 @@ class Stage03Model(nn.Module):
                 f"got {obs_features.size(-1)}"
             )
         h = self.trunk(obs_features.float())
-        discard_logits = self.discard_head(h)
-        if discard_mask is not None:
-            discard_logits = _apply_discard_mask(discard_logits, discard_mask)
         value = self.value_head(h).squeeze(-1)
         terminal_logits = self.terminal_head(h)
         yaku_logits = self.yaku_head(h)
+        discard_input = self._augment_with_semantic_summary(
+            h, terminal_logits, yaku_logits
+        )
+        discard_logits = self.discard_head(discard_input)
+        if discard_mask is not None:
+            discard_logits = _apply_discard_mask(discard_logits, discard_mask)
         return Stage03ForwardOutput(
             discard_logits=discard_logits,
             value=value,
@@ -311,11 +343,55 @@ class Stage03Model(nn.Module):
             )
         # h を (B, C, H) に expand
         h_expanded = h.unsqueeze(1).expand(B, C, h.size(-1))
-        scorer_input = torch.cat(
-            [h_expanded, candidate_features.float()], dim=-1
-        )  # (B, C, H + candidate_dim)
+        if self._semantic_summary_dim > 0:
+            terminal_logits = self.terminal_head(h)
+            yaku_logits = self.yaku_head(h)
+            summary = self._compute_semantic_summary(terminal_logits, yaku_logits)
+            summary_expanded = summary.unsqueeze(1).expand(B, C, summary.size(-1))
+            scorer_input = torch.cat(
+                [h_expanded, summary_expanded, candidate_features.float()],
+                dim=-1,
+            )
+        else:
+            scorer_input = torch.cat(
+                [h_expanded, candidate_features.float()], dim=-1
+            )
         scores = self.candidate_scorer(scorer_input).squeeze(-1)  # (B, C)
         return CandidateScoreOutput(candidate_scores=scores)
+
+    # ------------------------------------------------------------------
+    # semantic summary helpers (Stage02 CQ-0256 移植)
+    # ------------------------------------------------------------------
+
+    def _compute_semantic_summary(
+        self,
+        terminal_logits: torch.Tensor,
+        yaku_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """terminal / yaku logits を policy 入力用に確率化して連結する。
+
+        Stage02 仕様: terminal は softmax、yaku は sigmoid を取り、policy 経路に
+        流すときは detach する。``config.semantic_summary_detach=False`` のときだけ
+        gradient を逆流させる (debug 用)。
+        """
+        terminal_prob = torch.softmax(terminal_logits, dim=-1)
+        yaku_prob = torch.sigmoid(yaku_logits)
+        summary = torch.cat([terminal_prob, yaku_prob], dim=-1)
+        if self._config.semantic_summary_detach:
+            summary = summary.detach()
+        return summary
+
+    def _augment_with_semantic_summary(
+        self,
+        trunk_hidden: torch.Tensor,
+        terminal_logits: torch.Tensor,
+        yaku_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """discard head 入力を semantic summary で拡張する (opt-in)。"""
+        if self._semantic_summary_dim == 0:
+            return trunk_hidden
+        summary = self._compute_semantic_summary(terminal_logits, yaku_logits)
+        return torch.cat([trunk_hidden, summary], dim=-1)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,11 @@ from mahjong_agent.actions.types import ActionFamily
 from mahjong_agent.data.collate import collate_decision_samples
 from mahjong_agent.data.types import DecisionBatch, DecisionSample
 from mahjong_agent.models.stage03_model import Stage03Model
+from mahjong_agent.training.optimizer_groups import (
+    LRGroupConfig,
+    build_lr_grouped_optimizer,
+)
+from mahjong_agent.training.sample_weighting import compute_per_player_round_weights
 
 _NORMAL_DISCARD_FAMILY: str = ActionFamily.NORMAL_DISCARD.value
 _LARGE_NEG: float = -1.0e9
@@ -111,6 +116,20 @@ class PPOConfig:
     gradient_norms_max_batches_per_epoch: int = 4
     advantage_normalize: bool = True
     include_actor_types: tuple[str, ...] = ("policy",)
+    # Stage02 由来の learner stabilizer (opt-in)。default は全て off で
+    # 現行挙動と互換。
+    lr_group_config: LRGroupConfig | None = None
+    """Stage02 由来の policy / value_semantic / trunk lr 分離。``None`` または
+    ``LRGroupConfig(enabled=False)`` で single group optimizer (現行互換)。"""
+    exclude_post_riichi_discards: bool = False
+    """``DecisionSample.metadata["is_post_riichi_discard"]==True`` を policy /
+    value 両方の loss から除外する (Stage02 CQ-0164 移植)。default off。"""
+    value_loss_includes_excluded: bool = False
+    """``ppo_exclude=True`` (= TSUMO / RON / KYUSHU shortcut sample) を value
+    loss に **だけ** 含める。policy loss には絶対に混ぜない。default off。"""
+    per_player_round_weighting: bool = False
+    """同一 ``(episode_id, round_id, player_id)`` の sample 重み合計が 1.0 に
+    なるよう normalize する weighting (Stage02 CQ-0268 移植)。default off。"""
 
 
 @dataclass(frozen=True)
@@ -150,9 +169,19 @@ class PPOMetrics:
     target_kl_applied_minibatches: int = 0
     num_updates: int = 0
     grad_norm: float = 0.0
+    # Stage02 stabilizer diagnostics (opt-in flags の効果を可視化)
+    post_riichi_excluded_count: int = 0
+    """``exclude_post_riichi_discards`` で policy / value 両方から除外した
+    sample 数。flag off では常に 0。"""
+    value_loss_extra_shortcut_count: int = 0
+    """``value_loss_includes_excluded=True`` のとき、value loss に追加で含めた
+    shortcut (= ``ppo_exclude=True``) sample 数。flag off では常に 0。"""
     decision_family: dict[str, dict[str, float]] = field(default_factory=dict)
     actor_type_counts: dict[str, int] = field(default_factory=dict)
     grad_norms_per_component: dict[str, float] = field(default_factory=dict)
+    lr_groups_info: dict[str, Any] = field(default_factory=dict)
+    """``build_lr_grouped_optimizer`` から得た JSON serializable diagnostics。
+    optimizer を共有する epoch 集約では同じ dict を再 attach する。"""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,6 +217,10 @@ class PPOMetrics:
             ),
             "num_updates": int(self.num_updates),
             "grad_norm": float(self.grad_norm),
+            "post_riichi_excluded_count": int(self.post_riichi_excluded_count),
+            "value_loss_extra_shortcut_count": int(
+                self.value_loss_extra_shortcut_count
+            ),
             "decision_family": {
                 str(k): {str(kk): float(vv) for kk, vv in v.items()}
                 for k, v in self.decision_family.items()
@@ -198,6 +231,7 @@ class PPOMetrics:
             "grad_norms_per_component": {
                 str(k): float(v) for k, v in self.grad_norms_per_component.items()
             },
+            "lr_groups_info": dict(self.lr_groups_info),
         }
 
 
@@ -235,15 +269,29 @@ class PPOTrainingData:
     advantages:
         ``(N,) float32``。samples と同 order。
     eligible:
-        ``(N,) bool``。PPO 対象 (= ``actor_type`` が
+        ``(N,) bool``。policy loss 対象 (= ``actor_type`` が
         ``config.include_actor_types`` に含まれる、かつ ``decision_family``
-        が discard か候補で ``selected_*`` が有効) フラグ。
+        が discard か候補で ``selected_*`` が有効、shortcut / post-riichi 除外)
+        フラグ。
+    value_eligible:
+        ``(N,) bool``。value loss 対象。``eligible`` を base に、
+        ``config.value_loss_includes_excluded`` が True なら shortcut
+        (``ppo_exclude=True``) sample を追加で含める。``config.exclude_post_riichi_discards``
+        が True の post-riichi sample は **policy / value 両方** から除外。
+    sample_weight:
+        ``(N,) float32``。**常に全 1.0**。per-player-round weighting は
+        ``_iter_minibatches`` で minibatch-local に計算する設計に統一した
+        ため、trajectory 全体スコープのこの field では重みを持たない
+        (= imitation と同じ minibatch-local semantics に揃える)。
+        後方互換のため field 自体は残してある。
     """
 
     samples: list[DecisionSample]
     returns: np.ndarray
     advantages: np.ndarray
     eligible: np.ndarray
+    value_eligible: np.ndarray
+    sample_weight: np.ndarray
 
 
 def compute_returns_and_advantages(
@@ -280,10 +328,18 @@ def compute_returns_and_advantages(
     returns = np.zeros(n, dtype=np.float32)
     advantages = np.zeros(n, dtype=np.float32)
     eligible = np.zeros(n, dtype=bool)
+    value_eligible = np.zeros(n, dtype=bool)
+    sample_weight = np.ones(n, dtype=np.float32)
 
     if n == 0:
-        return PPOTrainingData(samples=samples, returns=returns,
-                                advantages=advantages, eligible=eligible)
+        return PPOTrainingData(
+            samples=samples,
+            returns=returns,
+            advantages=advantages,
+            eligible=eligible,
+            value_eligible=value_eligible,
+            sample_weight=sample_weight,
+        )
 
     # group by trajectory key
     traj_indices: dict[tuple[str, int], list[int]] = {}
@@ -314,27 +370,44 @@ def compute_returns_and_advantages(
             next_value = v
 
     include_set = set(str(x) for x in config.include_actor_types)
+    exclude_post_riichi = bool(config.exclude_post_riichi_discards)
+    include_shortcut_in_value = bool(config.value_loss_includes_excluded)
     for i, s in enumerate(samples):
         if str(s.actor_type) not in include_set:
             continue
-        # deterministic shortcut (e.g., TSUMO/RON/KYUSHU の auto-take) は
-        # log_prob が定数 0 で意味を持たないため、ratio 計算から除外する。
-        # ``ModelPolicyAgent`` 経由でこの flag を立てる。
-        if bool(s.metadata.get("ppo_exclude", False)):
+        meta = s.metadata or {}
+        is_shortcut = bool(meta.get("ppo_exclude", False))
+        is_post_riichi = bool(meta.get("is_post_riichi_discard", False))
+        # post-riichi 除外は policy / value 両方に効く (Stage02 と同方針)。
+        if exclude_post_riichi and is_post_riichi:
             continue
+        # selected_* validity
         if str(s.decision_family) == _NORMAL_DISCARD_FAMILY:
             if int(s.selected_discard_tile_type) < 0:
                 continue
         else:
             if int(s.selected_candidate_index) < 0:
                 continue
+        if is_shortcut:
+            # value loss にだけ含める opt-in (policy には絶対入れない)。
+            if include_shortcut_in_value:
+                value_eligible[i] = True
+            continue
         eligible[i] = True
+        value_eligible[i] = True
+
+    # per-player-round weighting は **minibatch-local** に計算する
+    # (= imitation と同じ semantics)。ここでは全 1.0 のまま置き、
+    # 実際の重みは ``_iter_minibatches`` が sub_samples から計算する。
+    # これにより PPO / imitation で flag の意味が一致する。
 
     return PPOTrainingData(
         samples=samples,
         returns=returns,
         advantages=advantages,
         eligible=eligible,
+        value_eligible=value_eligible,
+        sample_weight=sample_weight,
     )
 
 
@@ -356,13 +429,32 @@ class PPOBatch:
     advantages:
         ``(N,)`` float32 tensor。
     eligible:
-        ``(N,)`` bool tensor。``actor_type`` 含めた PPO 対象 mask。
+        ``(N,)`` bool tensor。policy loss 対象。
+    value_eligible:
+        ``(N,)`` bool tensor。value loss 対象。``eligible`` の superset で、
+        opt-in 時 shortcut sample を追加で含む。default ``None`` は
+        ``eligible`` をそのままコピーして使う (= 旧テスト・旧呼び出し互換)。
+    sample_weight:
+        ``(N,)`` float32 tensor。default 全 1.0、weighting 有効時は
+        per-(episode, round, player) 正規化重み。default ``None`` は
+        全 1.0 を自動生成する (= 旧呼び出し互換)。
     """
 
     batch: DecisionBatch
     returns: torch.Tensor
     advantages: torch.Tensor
     eligible: torch.Tensor
+    value_eligible: torch.Tensor | None = None
+    sample_weight: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        # default fill: value_eligible は eligible と同じ、sample_weight は全 1.0
+        if self.value_eligible is None:
+            self.value_eligible = self.eligible.clone()
+        if self.sample_weight is None:
+            self.sample_weight = torch.ones_like(
+                self.eligible, dtype=torch.float32
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +529,8 @@ def compute_ppo_loss(
     yaku_target = ppo_batch.batch.yaku_target.to(device).float()
     yaku_loss_mask = ppo_batch.batch.yaku_loss_mask.to(device).float()
     eligible = ppo_batch.eligible.to(device).bool()
+    value_eligible = ppo_batch.value_eligible.to(device).bool()
+    sample_weight = ppo_batch.sample_weight.to(device).float()
     advantages = ppo_batch.advantages.to(device).float()
     returns = ppo_batch.returns.to(device).float()
 
@@ -519,13 +613,28 @@ def compute_ppo_loss(
         (ratio_all < 1.0 - eps) | (ratio_all > 1.0 + eps)
     )
 
-    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _masked_mean(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """weighted masked mean。weights が None なら旧来の equal weight。"""
         m = mask.float()
-        denom = m.sum().clamp_min(1.0)
-        return (values * m).sum() / denom
+        if weights is None:
+            denom = m.sum().clamp_min(1.0)
+            return (values * m).sum() / denom
+        w = (m * weights).clamp_min(0.0)
+        denom = w.sum().clamp_min(1e-8)
+        return (values * w).sum() / denom
 
+    weights_for_loss = (
+        sample_weight if bool(config.per_player_round_weighting) else None
+    )
     if int(valid_mask.sum().item()) > 0:
-        policy_loss_t = _masked_mean(per_sample_loss, valid_mask)
+        policy_loss_t = _masked_mean(
+            per_sample_loss, valid_mask, weights=weights_for_loss
+        )
     else:
         policy_loss_t = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -536,7 +645,9 @@ def compute_ppo_loss(
     discard_kl_max = 0.0
     discard_entropy_sum = torch.zeros((), device=device, dtype=torch.float32)
     if discard_count > 0:
-        discard_policy_loss_t = _masked_mean(per_sample_loss, discard_valid)
+        discard_policy_loss_t = _masked_mean(
+            per_sample_loss, discard_valid, weights=weights_for_loss
+        )
         with torch.no_grad():
             discard_clip_count = int(
                 (clip_per_sample & discard_valid).sum().item()
@@ -560,7 +671,9 @@ def compute_ppo_loss(
     cand_kl_max = 0.0
     cand_entropy_sum = torch.zeros((), device=device, dtype=torch.float32)
     if candidate_count > 0:
-        candidate_policy_loss_t = _masked_mean(per_sample_loss, cand_valid)
+        candidate_policy_loss_t = _masked_mean(
+            per_sample_loss, cand_valid, weights=weights_for_loss
+        )
         with torch.no_grad():
             cand_clip_count = int((clip_per_sample & cand_valid).sum().item())
             cand_kl_sum = (kl_per_sample * cand_valid.float()).sum()
@@ -582,12 +695,19 @@ def compute_ppo_loss(
     yaku_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     yaku_count = 0
     if not config.policy_only:
-        # value loss: eligible sample (= PPO 対象 sample) のみで MSE。
-        if bool(eligible.any().item()):
-            idx_v = eligible.nonzero(as_tuple=False).flatten()
+        # value loss: value_eligible (= eligible ∪ opt-in shortcut)
+        # の sample で MSE。per-player-round weighting も適用する。
+        if bool(value_eligible.any().item()):
+            idx_v = value_eligible.nonzero(as_tuple=False).flatten()
             v_pred = fwd.value[idx_v]
             v_target = returns[idx_v]
-            value_loss_t = 0.5 * (v_pred - v_target).pow(2).mean()
+            v_sq = (v_pred - v_target).pow(2)
+            if bool(config.per_player_round_weighting):
+                w_v = sample_weight[idx_v].clamp_min(0.0)
+                denom = w_v.sum().clamp_min(1e-8)
+                value_loss_t = 0.5 * (v_sq * w_v).sum() / denom
+            else:
+                value_loss_t = 0.5 * v_sq.mean()
             value_count = int(idx_v.numel())
         # terminal aux
         term_valid = terminal_class >= 0
@@ -654,6 +774,20 @@ def compute_ppo_loss(
     for at in ppo_batch.batch.actor_type:
         actor_type_counter[str(at)] = actor_type_counter.get(str(at), 0) + 1
 
+    # Stage02 stabilizer diagnostics: post-riichi 除外 / shortcut value 加算
+    post_riichi_excluded_count = 0
+    value_loss_extra_shortcut_count = 0
+    if bool(config.exclude_post_riichi_discards):
+        post_riichi_excluded_count = sum(
+            1
+            for md in ppo_batch.batch.metadata
+            if bool((md or {}).get("is_post_riichi_discard", False))
+        )
+    if bool(config.value_loss_includes_excluded):
+        # eligible では無いが value_eligible には入っている sample 数
+        extra_mask = value_eligible & (~eligible)
+        value_loss_extra_shortcut_count = int(extra_mask.sum().item())
+
     # decision_family subdict
     family_stats: dict[str, dict[str, float]] = {}
     if discard_count > 0:
@@ -707,9 +841,12 @@ def compute_ppo_loss(
         target_kl_applied_minibatches=0,
         num_updates=0,
         grad_norm=0.0,
+        post_riichi_excluded_count=post_riichi_excluded_count,
+        value_loss_extra_shortcut_count=value_loss_extra_shortcut_count,
         decision_family=family_stats,
         actor_type_counts=actor_type_counter,
         grad_norms_per_component={},
+        lr_groups_info={},
     )
     return total_loss, metrics
 
@@ -722,11 +859,36 @@ def compute_ppo_loss(
 def make_default_ppo_optimizer(
     model: nn.Module, config: PPOConfig
 ) -> optim.Optimizer:
-    """AdamW を ``PPOConfig`` 設定で作る convenience。"""
-    return optim.AdamW(
-        model.parameters(),
-        lr=float(config.learning_rate),
-        weight_decay=float(config.weight_decay),
+    """AdamW を ``PPOConfig`` 設定で作る convenience。
+
+    ``config.lr_group_config.enabled=True`` のときは Stage02 由来の lr group
+    分離を有効化する。group ごとの parameter count / lr 情報は
+    ``build_lr_grouped_optimizer`` の戻り値を捨てて optimizer のみ返す。
+    diagnostic として info dict が欲しい呼び出し側は
+    ``build_lr_grouped_optimizer`` を直接使う。
+    """
+    opt, _info = build_lr_grouped_optimizer(
+        model,
+        base_lr=float(config.learning_rate),
+        base_weight_decay=float(config.weight_decay),
+        lr_group_config=config.lr_group_config,
+        optimizer_cls=optim.AdamW,
+    )
+    return opt
+
+
+def make_ppo_optimizer_with_info(
+    model: nn.Module, config: PPOConfig
+) -> tuple[optim.Optimizer, dict[str, Any]]:
+    """``make_default_ppo_optimizer`` と同等だが、lr group diagnostics 情報も
+    返す。runbook / experiment report で param group breakdown が必要なときに使う。
+    """
+    return build_lr_grouped_optimizer(
+        model,
+        base_lr=float(config.learning_rate),
+        base_weight_decay=float(config.weight_decay),
+        lr_group_config=config.lr_group_config,
+        optimizer_cls=optim.AdamW,
     )
 
 
@@ -736,8 +898,16 @@ def _iter_minibatches(
     *,
     shuffle: bool,
     rng: _random.Random,
+    per_player_round_weighting: bool = False,
 ) -> Iterable[PPOBatch]:
-    """``PPOTrainingData`` を minibatch 化して ``PPOBatch`` を yield する。"""
+    """``PPOTrainingData`` を minibatch 化して ``PPOBatch`` を yield する。
+
+    ``per_player_round_weighting=True`` のとき、各 minibatch の
+    ``sub_samples`` から **minibatch-local** に per-(episode, round, player)
+    weight を計算して ``PPOBatch.sample_weight`` に渡す (= imitation と同じ
+    minibatch-local semantics)。``data.sample_weight`` は使わない (常に全 1.0
+    のため)。
+    """
     n = len(data.samples)
     if n == 0:
         return
@@ -750,12 +920,23 @@ def _iter_minibatches(
         sub_returns = data.returns[idxs]
         sub_advs = data.advantages[idxs]
         sub_elig = data.eligible[idxs]
+        sub_value_elig = data.value_eligible[idxs]
+        if per_player_round_weighting:
+            sub_weights = compute_per_player_round_weights(
+                episode_ids=[str(s.episode_id) for s in sub_samples],
+                round_ids=[int(s.round_id) for s in sub_samples],
+                player_ids=[int(s.player_id) for s in sub_samples],
+            )
+        else:
+            sub_weights = np.ones(len(sub_samples), dtype=np.float32)
         batch = collate_decision_samples(sub_samples)
         yield PPOBatch(
             batch=batch,
             returns=torch.from_numpy(sub_returns.copy()),
             advantages=torch.from_numpy(sub_advs.copy()),
             eligible=torch.from_numpy(sub_elig.copy()),
+            value_eligible=torch.from_numpy(sub_value_elig.copy()),
+            sample_weight=torch.from_numpy(sub_weights.copy()),
         )
 
 
@@ -844,6 +1025,7 @@ def train_ppo_epoch(
             batch_size=int(config.batch_size),
             shuffle=bool(config.shuffle),
             rng=rng,
+            per_player_round_weighting=bool(config.per_player_round_weighting),
         )
     else:
         batches_iter = data_or_batches  # type: ignore[assignment]
@@ -950,6 +1132,7 @@ def _component_grad_norms(
     returns = batch.returns.to(device).float()
     advantages = batch.advantages.to(device).float()
     eligible = batch.eligible.to(device).bool()
+    value_eligible = batch.value_eligible.to(device).bool()
     is_normal = torch.tensor(
         [fam == _NORMAL_DISCARD_FAMILY for fam in batch.batch.decision_family],
         dtype=torch.bool,
@@ -1012,8 +1195,8 @@ def _component_grad_norms(
     components["policy"] = pol_loss
 
     # value
-    if not config.policy_only and eligible.any():
-        idx_v = eligible.nonzero(as_tuple=False).flatten()
+    if not config.policy_only and value_eligible.any():
+        idx_v = value_eligible.nonzero(as_tuple=False).flatten()
         v_pred = fwd.value[idx_v]
         v_tgt = returns[idx_v]
         components["value"] = 0.5 * (v_pred - v_tgt).pow(2).mean()
@@ -1086,9 +1269,12 @@ def _with_extras(
         target_kl_applied_minibatches=int(target_kl_applied),
         num_updates=int(num_updates),
         grad_norm=float(grad_norm),
+        post_riichi_excluded_count=metrics.post_riichi_excluded_count,
+        value_loss_extra_shortcut_count=metrics.value_loss_extra_shortcut_count,
         decision_family=dict(metrics.decision_family),
         actor_type_counts=dict(metrics.actor_type_counts),
         grad_norms_per_component=dict(grad_norms_per_component),
+        lr_groups_info=dict(metrics.lr_groups_info),
     )
 
 
@@ -1109,6 +1295,8 @@ def _aggregate_epoch_metrics(
             target_kl_checked_minibatches=int(target_kl_checked),
             target_kl_skipped_minibatches=int(target_kl_skipped),
             target_kl_applied_minibatches=int(target_kl_applied),
+            post_riichi_excluded_count=0,
+            value_loss_extra_shortcut_count=0,
         )
 
     total_samples = sum(m.num_samples for m in applied)
@@ -1241,9 +1429,18 @@ def _aggregate_epoch_metrics(
         target_kl_applied_minibatches=int(target_kl_applied),
         num_updates=sum(int(m.num_updates) for m in applied),
         grad_norm=float(grad_norm),
+        post_riichi_excluded_count=sum(
+            int(m.post_riichi_excluded_count) for m in applied
+        ),
+        value_loss_extra_shortcut_count=sum(
+            int(m.value_loss_extra_shortcut_count) for m in applied
+        ),
         decision_family=family_agg,
         actor_type_counts=actor_agg,
         grad_norms_per_component=comp_agg,
+        lr_groups_info=(
+            dict(applied[0].lr_groups_info) if applied else {}
+        ),
     )
 
 
@@ -1257,8 +1454,9 @@ def fit_ppo(
     """``samples`` 上で ``config.num_epochs`` epoch 回す convenience。"""
     if not samples:
         raise ValueError("fit_ppo: empty samples")
+    lr_groups_info: dict[str, Any] = {}
     if optimizer is None:
-        optimizer = make_default_ppo_optimizer(model, config)
+        optimizer, lr_groups_info = make_ppo_optimizer_with_info(model, config)
     data = compute_returns_and_advantages(samples, config)
     rng = _random.Random(config.seed)
     result = PPORunResult()
@@ -1266,12 +1464,64 @@ def fit_ppo(
         epoch_metrics, early_stopped = train_ppo_epoch(
             model, data, optimizer, config, rng=rng
         )
+        # epoch metrics に lr_groups_info を attach (optimizer ごとに固定値)。
+        if lr_groups_info:
+            epoch_metrics = _attach_lr_groups_info(
+                epoch_metrics, lr_groups_info
+            )
         result.epochs.append(epoch_metrics)
         if early_stopped:
             result.early_stopped = True
             break
     result.final = result.epochs[-1] if result.epochs else None
     return result
+
+
+def _attach_lr_groups_info(
+    metrics: PPOMetrics, info: dict[str, Any]
+) -> PPOMetrics:
+    return _with_extras(
+        PPOMetrics(
+            loss=metrics.loss,
+            policy_loss=metrics.policy_loss,
+            value_loss=metrics.value_loss,
+            entropy=metrics.entropy,
+            terminal_loss=metrics.terminal_loss,
+            yaku_loss=metrics.yaku_loss,
+            discard_policy_loss=metrics.discard_policy_loss,
+            candidate_policy_loss=metrics.candidate_policy_loss,
+            discard_count=metrics.discard_count,
+            candidate_count=metrics.candidate_count,
+            value_count=metrics.value_count,
+            terminal_count=metrics.terminal_count,
+            yaku_count=metrics.yaku_count,
+            num_samples=metrics.num_samples,
+            num_batches=metrics.num_batches,
+            ppo_included_count=metrics.ppo_included_count,
+            ppo_excluded_count=metrics.ppo_excluded_count,
+            ppo_excluded_by_actor_type=metrics.ppo_excluded_by_actor_type,
+            clip_fraction=metrics.clip_fraction,
+            approx_kl_mean=metrics.approx_kl_mean,
+            approx_kl_max=metrics.approx_kl_max,
+            target_kl_checked_minibatches=metrics.target_kl_checked_minibatches,
+            target_kl_skipped_minibatches=metrics.target_kl_skipped_minibatches,
+            target_kl_applied_minibatches=metrics.target_kl_applied_minibatches,
+            num_updates=metrics.num_updates,
+            grad_norm=metrics.grad_norm,
+            post_riichi_excluded_count=metrics.post_riichi_excluded_count,
+            value_loss_extra_shortcut_count=metrics.value_loss_extra_shortcut_count,
+            decision_family=dict(metrics.decision_family),
+            actor_type_counts=dict(metrics.actor_type_counts),
+            grad_norms_per_component=dict(metrics.grad_norms_per_component),
+            lr_groups_info=dict(info),
+        ),
+        grad_norm=metrics.grad_norm,
+        target_kl_checked=metrics.target_kl_checked_minibatches,
+        target_kl_skipped=metrics.target_kl_skipped_minibatches,
+        target_kl_applied=metrics.target_kl_applied_minibatches,
+        num_updates=metrics.num_updates,
+        grad_norms_per_component=dict(metrics.grad_norms_per_component),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1534,7 @@ def ppo_metrics_to_json(metrics: PPOMetrics) -> str:
 
 
 __all__ = [
+    "LRGroupConfig",
     "PPOConfig",
     "PPOMetrics",
     "PPORunResult",
@@ -1294,5 +1545,6 @@ __all__ = [
     "train_ppo_epoch",
     "fit_ppo",
     "make_default_ppo_optimizer",
+    "make_ppo_optimizer_with_info",
     "ppo_metrics_to_json",
 ]
