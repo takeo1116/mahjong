@@ -45,6 +45,8 @@ from mahjong_agent.agents import (
     RandomAgent,
     RuleBasedBaselineAgent,
 )
+from mahjong_agent.baseline import _fast
+from mahjong_agent.baseline.discard_select import find_best_discard
 from mahjong_agent.baseline.shanten import compute_shanten
 from mahjong_agent.baseline.ukeire import count_acceptance
 from mahjong_agent.encoders import PublicObservationEncoder
@@ -267,6 +269,89 @@ def make_model_sa() -> SeatAgents:
 
 
 # ---------------------------------------------------------------------------
+# C++ fast path vs Python fallback comparison (ISSUE-0017)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _force_fast(enabled: bool):
+    """``_fast.FAST_AVAILABLE`` を一時的に切り替える (context 終了で復元)。"""
+    prev = _fast.FAST_AVAILABLE
+    _fast.FAST_AVAILABLE = bool(enabled and prev)
+    try:
+        yield _fast.FAST_AVAILABLE
+    finally:
+        _fast.FAST_AVAILABLE = prev
+
+
+def bench_fast_vs_fallback(
+    *, encode_n: int = 200, fbd_n: int = 200, teacher_games: int = 10
+) -> dict[str, Any]:
+    """fast path enabled / fallback forced を比較する。"""
+    out: dict[str, Any] = {"ext_available": bool(_fast.FAST_AVAILABLE)}
+    obs = _real_obs(seed=0)
+    counts = [0] * 34
+    for tid in obs.hand:
+        counts[int(tid) // 4] += 1
+    legal = [1.0 if counts[t] > 0 else 0.0 for t in range(34)]
+
+    def _time_encode() -> float:
+        enc = PublicObservationEncoder(enable_hints=True)
+        enc.encode_observation(obs)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(encode_n):
+            enc.encode_observation(obs)
+        return (time.perf_counter() - t0) / encode_n * 1000
+
+    def _time_fbd() -> float:
+        find_best_discard(counts, legal, meld_count=0)  # warmup
+        t0 = time.perf_counter()
+        for _ in range(fbd_n):
+            find_best_discard(counts, legal, meld_count=0)
+        return (time.perf_counter() - t0) / fbd_n * 1000
+
+    def _time_teacher_rollout() -> float:
+        runner = SelfPlayRunner(
+            config=SelfPlayConfig(
+                game_type=riichienv.GameType.YON_TONPUSEN,
+                max_steps_per_game=8000,
+            )
+        )
+        t0 = time.perf_counter()
+        for seed in range(teacher_games):
+            sa = make_rule_sa()
+            runner.run_episode(sa, seed=seed)
+        return time.perf_counter() - t0
+
+    for label, enabled in (("fast", True), ("fallback", False)):
+        with _force_fast(enabled) as active:
+            out[f"{label}_active"] = bool(active)
+            out[f"{label}_encode_hints_on_ms_per_call"] = _time_encode()
+            out[f"{label}_find_best_discard_ms_per_call"] = _time_fbd()
+            out[f"{label}_teacher_rollout_{teacher_games}games_s"] = (
+                _time_teacher_rollout()
+            )
+
+    # speedup ratios
+    if out.get("fallback_encode_hints_on_ms_per_call", 0) > 0:
+        out["encode_speedup_x"] = (
+            out["fallback_encode_hints_on_ms_per_call"]
+            / out["fast_encode_hints_on_ms_per_call"]
+            if out["fast_encode_hints_on_ms_per_call"] > 0
+            else 0.0
+        )
+    if out.get(f"fallback_teacher_rollout_{teacher_games}games_s", 0) > 0:
+        fast_s = out[f"fast_teacher_rollout_{teacher_games}games_s"]
+        out["teacher_rollout_speedup_x"] = (
+            out[f"fallback_teacher_rollout_{teacher_games}games_s"] / fast_s
+            if fast_s > 0
+            else 0.0
+        )
+        out["fast_teacher_rollout_s_per_game"] = fast_s / max(1, teacher_games)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -290,9 +375,24 @@ def main() -> None:
                         help="Number of hint-component repetitions.")
     parser.add_argument("--rollout-seeds", type=int, default=2,
                         help="Seeds per agent for rollout benchmark.")
+    parser.add_argument("--compare-fast", action="store_true",
+                        help="Compare C++ fast path vs Python fallback.")
+    parser.add_argument("--teacher-games", type=int, default=10,
+                        help="Teacher rollout games for --compare-fast.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
+
+    if args.compare_fast:
+        cmp_bench = bench_fast_vs_fallback(
+            encode_n=args.encode_n,
+            teacher_games=args.teacher_games,
+        )
+        _print_section("Fast path vs fallback", cmp_bench)
+        if args.json:
+            print("\n[JSON]")
+            print(json.dumps(cmp_bench, indent=2, ensure_ascii=False))
+        return
 
     encoder_bench = bench_encoder(num_calls=args.encode_n)
     _print_section("Encoder benchmark", encoder_bench)

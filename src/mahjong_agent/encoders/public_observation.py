@@ -35,6 +35,7 @@ from mahjong_agent.actions.types import (
     ModelAction,
     tile_id_to_type,
 )
+from mahjong_agent.baseline import _fast
 from mahjong_agent.baseline.shanten import compute_shanten
 from mahjong_agent.baseline.ukeire import count_acceptance
 from mahjong_agent.encoders.metadata import EncoderMetadata
@@ -403,6 +404,41 @@ class PublicObservationEncoder:
         # 2) shanten_delta_per_discard / 3) discard_ukeire_per_tile
         shanten_delta = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
         ukeire_per_tile = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+        if _fast.FAST_AVAILABLE:
+            # C++ fast path: 全 tile の shanten_after / acceptance を 1 回で取得。
+            # legal_mask は「手牌にある全 tile」(= analyze_discards が
+            # counts<1 を自動 skip するので all-ones で渡す)。Python loop と
+            # 同一 semantics (seen_counts=None = 手牌側のみ既見扱い)。
+            try:
+                analysis = _fast.analyze_discards(
+                    hand_counts_list, [1] * _NUM_TILE_TYPES, meld_count
+                )
+                sh_after_arr = analysis["shanten_after"]
+                acc_arr = analysis["acceptance"]
+            except (ValueError, RuntimeError):
+                sh_after_arr = None
+                acc_arr = None
+            if sh_after_arr is not None:
+                for t in range(_NUM_TILE_TYPES):
+                    if hand_counts_list[t] <= 0:
+                        continue
+                    sh_after = int(sh_after_arr[t])
+                    acc = int(acc_arr[t])
+                    d = current_shanten - sh_after
+                    shanten_delta[t] = max(-1.0, min(1.0, float(d) / 4.0))
+                    ukeire_per_tile[t] = min(1.0, float(acc) / _UKEIRE_DENOM)
+                _set_range(
+                    feat, self._obs_ranges,
+                    "shanten_delta_per_discard", shanten_delta,
+                )
+                _set_range(
+                    feat, self._obs_ranges,
+                    "discard_ukeire_per_tile", ukeire_per_tile,
+                )
+                return self._encode_hints_tail(
+                    feat, obs, hand_counts_list
+                )
+        # Python fallback: per-tile に shanten + ukeire を計算する。
         for t in range(_NUM_TILE_TYPES):
             if hand_counts_list[t] <= 0:
                 continue
@@ -423,7 +459,17 @@ class PublicObservationEncoder:
             )
         _set_range(feat, self._obs_ranges, "shanten_delta_per_discard", shanten_delta)
         _set_range(feat, self._obs_ranges, "discard_ukeire_per_tile", ukeire_per_tile)
+        self._encode_hints_tail(feat, obs, hand_counts_list)
+        return None
 
+    def _encode_hints_tail(
+        self,
+        feat: np.ndarray,
+        obs: Any,
+        hand_counts_list: list[int],
+    ) -> None:
+        """hint feature の残り (remaining_draws / turn_progress /
+        tile_presence_flags) を書き込む。fast / fallback 両 path から呼ぶ。"""
         # 4) remaining_draws_norm / 5) turn_progress_norm
         # 公開河の枚数合計から残り山を概算する。
         total_discarded = 0

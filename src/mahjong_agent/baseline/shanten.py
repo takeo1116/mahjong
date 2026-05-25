@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from mahjong_agent.baseline import _fast
+
 # 么九牌 (1m, 9m, 1p, 9p, 1s, 9s, 東, 南, 西, 北, 白, 發, 中)
 _TERMINALS_AND_HONORS: tuple[int, ...] = (
     0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33,
@@ -22,6 +24,9 @@ def compute_shanten(
     meld_count: int = 0,
 ) -> int:
     """34 種 tile_type 枚数からシャンテン数を返す。
+
+    C++ fast path (``mahjong_agent._mahjong_fast``) が利用可能ならそれを使い、
+    無い環境では下記の純 Python 実装に fallback する (同一アルゴリズム)。
 
     Parameters
     ----------
@@ -36,6 +41,20 @@ def compute_shanten(
     int:
         ``-1`` で和了、``0`` でテンパイ、``1`` で 1 向聴、... ``8`` まで。
     """
+    if len(counts) != 34:
+        raise ValueError(
+            f"shanten counts must be length 34, got {len(counts)}"
+        )
+    if _fast.FAST_AVAILABLE:
+        return _fast.compute_shanten(counts, int(meld_count))
+    return compute_shanten_python(counts, meld_count)
+
+
+def compute_shanten_python(
+    counts: Sequence[int],
+    meld_count: int = 0,
+) -> int:
+    """純 Python 実装の shanten 計算 (fast path 無し / 検証用)。"""
     if len(counts) != 34:
         raise ValueError(
             f"shanten counts must be length 34, got {len(counts)}"
@@ -210,4 +229,4 @@ def _count_partial(counts: list[int]) -> int:
     return partial
 
 
-__all__ = ["compute_shanten"]
+__all__ = ["compute_shanten", "compute_shanten_python"]

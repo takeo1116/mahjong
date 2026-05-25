@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from mahjong_agent.baseline import _fast
 from mahjong_agent.baseline.shanten import compute_shanten
 from mahjong_agent.baseline.ukeire import count_acceptance
 
@@ -82,6 +83,19 @@ def find_best_discard(
     if mask.size != _NUM_TILE_TYPES:
         raise ValueError(
             f"legal_mask must be length 34, got {mask.size}"
+        )
+
+    # C++ fast path: seen_counts を渡さない (= 手牌側のみを既見扱いする)
+    # ケースに限り使う。seen_counts 指定時は C++ API が対応しないため
+    # Python fallback に倒す。
+    if _fast.FAST_AVAILABLE and seen_counts is None:
+        legal_int = [1 if mask[t] >= 0.5 else 0 for t in range(_NUM_TILE_TYPES)]
+        res = _fast.find_best_discard(counts, legal_int, int(meld_count))
+        return DiscardSelectResult(
+            best_tile_type=int(res["best_tile"]),
+            best_mask=np.asarray(res["best_mask"], dtype=np.float32),
+            best_shanten=int(res["best_shanten"]),
+            best_acceptance=int(res["best_acceptance"]),
         )
 
     best_mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
