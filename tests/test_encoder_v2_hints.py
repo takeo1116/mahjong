@@ -18,9 +18,9 @@ def test_encoder_default_enables_hints():
     assert enc.enable_hints is True
     meta = enc.metadata()
     assert meta.observation_dim > 363
-    # 363 + hint dims (1 + 34 + 34 + 1 + 1 + 6) = 440
-    # (旧仕様にあった riichi_discard_mask=34 は削除済み)
-    assert meta.observation_dim == 440
+    # 363 + hint dims (1 + 34 + 34 + 1 + 1 + 6 + shape_hint 66) = 506
+    # (旧仕様にあった riichi_discard_mask=34 は削除済み、shape_hint 66 を追加)
+    assert meta.observation_dim == 506
 
 
 def test_encoder_with_hints_disabled_returns_legacy_dim():
@@ -40,8 +40,12 @@ def test_encoder_feature_ranges_include_new_hints():
         "remaining_draws_norm",
         "turn_progress_norm",
         "tile_presence_flags",
+        "shape_hint",
     }
     assert expected_hint_names <= set(ranges.keys())
+    # shape_hint は 66 dim
+    s, e = ranges["shape_hint"]
+    assert e - s == 66
     # contiguous な layout (= 全 range の合計 = observation_dim)
     total = sum(e - s for s, e in ranges.values())
     assert total == enc.metadata().observation_dim
@@ -66,6 +70,7 @@ def test_encoder_legacy_off_omits_hint_ranges():
         "remaining_draws_norm",
         "turn_progress_norm",
         "tile_presence_flags",
+        "shape_hint",
     }
     assert not (hint_names & set(ranges.keys()))
 

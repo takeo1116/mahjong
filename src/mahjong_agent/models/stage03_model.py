@@ -84,6 +84,20 @@ class Stage03ModelConfig:
     num_tile_types: int = _NUM_TILE_TYPES
     semantic_summary_in_policy: bool = False
     semantic_summary_detach: bool = True
+    direct_hint_in_policy: bool = True
+    """``True`` (default) のとき、per-tile hint (shanten_delta / discard_ukeire)
+    を tile-wise local scorer + context gate で discard logits に直接加算する
+    (Stage02 parity の direct hint branch)。Stage02 parity に寄せる方針のため
+    default on。``False`` を明示すると従来 (branch 無し) architecture に戻せる。
+    なお ``direct_hint_ranges`` が空 (= 34 幅 hint が無い legacy encoder 等) の
+    ときは、本 flag が True でも branch は構築されない (安全に無効化)。"""
+    direct_hint_ranges: tuple[tuple[str, int, int], ...] = ()
+    """direct hint branch が使う per-tile hint source の ``(name, start, end)``。
+    各 range は **34 幅** (= num_tile_types) でなければならない。
+    ``from_encoder_metadata(..., direct_hint_in_policy=True)`` が encoder の
+    feature_ranges から自動設定する。"""
+    direct_hint_tile_emb_dim: int = 4
+    direct_hint_hidden_dim: int = 16
 
     @classmethod
     def from_encoder_metadata(
@@ -96,8 +110,33 @@ class Stage03ModelConfig:
         dropout: float = 0.0,
         semantic_summary_in_policy: bool = False,
         semantic_summary_detach: bool = True,
+        direct_hint_in_policy: bool = True,
+        direct_hint_sources: tuple[str, ...] = (
+            "shanten_delta_per_discard",
+            "discard_ukeire_per_tile",
+        ),
     ) -> Stage03ModelConfig:
-        """``EncoderMetadata`` から observation_dim / candidate_dim を引き継いで config を作る。"""
+        """``EncoderMetadata`` から observation_dim / candidate_dim を引き継いで config を作る。
+
+        ``direct_hint_in_policy=True`` (default) のとき、``direct_hint_sources``
+        に挙げた per-tile hint feature の range を ``metadata.feature_ranges``
+        から引いて ``direct_hint_ranges`` に詰める (各 34 幅 を要求)。range が
+        無い / 幅が 34 でない source は skip する (= ``enable_hints=False`` の
+        legacy metadata では空 range になり branch は無効化される)。
+        ``direct_hint_in_policy=False`` を明示すると branch 無しに戻せる。
+        """
+        ranges: tuple[tuple[str, int, int], ...] = ()
+        if direct_hint_in_policy:
+            collected: list[tuple[str, int, int]] = []
+            fr = dict(metadata.feature_ranges)
+            for name in direct_hint_sources:
+                rng = fr.get(name)
+                if rng is None:
+                    continue
+                s, e = int(rng[0]), int(rng[1])
+                if e - s == _NUM_TILE_TYPES:
+                    collected.append((name, s, e))
+            ranges = tuple(collected)
         return cls(
             observation_dim=int(metadata.observation_dim),
             candidate_dim=int(metadata.candidate_dim),
@@ -107,6 +146,8 @@ class Stage03ModelConfig:
             dropout=float(dropout),
             semantic_summary_in_policy=bool(semantic_summary_in_policy),
             semantic_summary_detach=bool(semantic_summary_detach),
+            direct_hint_in_policy=bool(direct_hint_in_policy),
+            direct_hint_ranges=ranges,
         )
 
 
@@ -234,6 +275,41 @@ class Stage03Model(nn.Module):
         scorer_layers.append(nn.Linear(config.candidate_hidden_dim, 1))
         self.candidate_scorer = nn.Sequential(*scorer_layers)
 
+        # direct hint branch (Stage02 parity, opt-in)。per-tile hint source を
+        # tile-wise local scorer で delta logits に変換し、trunk context で
+        # gate して discard logits に加算する。default off では構築しない
+        # (= checkpoint 形状を変えない)。
+        self._direct_hint_ranges = tuple(config.direct_hint_ranges)
+        self._direct_hints_enabled = bool(
+            config.direct_hint_in_policy and len(self._direct_hint_ranges) > 0
+        )
+        if self._direct_hints_enabled:
+            for name, s, e in self._direct_hint_ranges:
+                if e - s != config.num_tile_types:
+                    raise ValueError(
+                        f"direct_hint_ranges[{name!r}] width {e - s} != "
+                        f"num_tile_types {config.num_tile_types}"
+                    )
+            num_sources = len(self._direct_hint_ranges)
+            emb_dim = int(config.direct_hint_tile_emb_dim)
+            local_hidden = int(config.direct_hint_hidden_dim)
+            self.direct_hint_tile_embedding = nn.Embedding(
+                config.num_tile_types, emb_dim
+            )
+            self.direct_hint_local_scorer = nn.Sequential(
+                nn.Linear(num_sources + emb_dim, local_hidden),
+                nn.ReLU(),
+                nn.Linear(local_hidden, 1),
+            )
+            self.direct_hint_context_gate = nn.Linear(
+                config.hidden_dim, config.num_tile_types
+            )
+            self.register_buffer(
+                "_direct_hint_tile_ids",
+                torch.arange(config.num_tile_types, dtype=torch.long),
+                persistent=False,
+            )
+
     @property
     def config(self) -> Stage03ModelConfig:
         return self._config
@@ -271,7 +347,8 @@ class Stage03Model(nn.Module):
                 f"obs_features last dim must be {self._config.observation_dim}, "
                 f"got {obs_features.size(-1)}"
             )
-        h = self.trunk(obs_features.float())
+        obs_f = obs_features.float()
+        h = self.trunk(obs_f)
         value = self.value_head(h).squeeze(-1)
         terminal_logits = self.terminal_head(h)
         yaku_logits = self.yaku_head(h)
@@ -279,6 +356,11 @@ class Stage03Model(nn.Module):
             h, terminal_logits, yaku_logits
         )
         discard_logits = self.discard_head(discard_input)
+        # direct hint branch: per-tile hint を gate 付き delta logits で加算
+        # する (mask 適用前)。gate は trunk context 由来なので、illegal idx は
+        # 後段の discard_mask で -1e9 化されて漏れない。
+        if self._direct_hints_enabled:
+            discard_logits = discard_logits + self._direct_hint_delta(obs_f, h)
         if discard_mask is not None:
             discard_logits = _apply_discard_mask(discard_logits, discard_mask)
         return Stage03ForwardOutput(
@@ -392,6 +474,43 @@ class Stage03Model(nn.Module):
             return trunk_hidden
         summary = self._compute_semantic_summary(terminal_logits, yaku_logits)
         return torch.cat([trunk_hidden, summary], dim=-1)
+
+    # ------------------------------------------------------------------
+    # direct hint branch (Stage02 parity)
+    # ------------------------------------------------------------------
+
+    def _direct_hint_delta(
+        self,
+        obs_features: torch.Tensor,
+        trunk_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """per-tile hint から discard logits への gate 付き delta を計算する。
+
+        Stage02 の ``_apply_direct_hints`` 移植:
+        - 各 hint source の 34 幅 slice を ``(B, 34, K)`` に stack。
+        - tile embedding ``(B, 34, emb)`` を concat して local scorer で
+          per-tile delta ``(B, 34)`` を出す。
+        - trunk context から sigmoid gate ``(B, 34)`` を作り、delta に乗じる。
+
+        Stage03 は単一 shared trunk のため、Stage02 のように hint range を
+        trunk 入力から除外しない (trunk は full obs を見る)。direct hint branch
+        は純粋に加算的な追加経路で、checkpoint 互換は default off で担保する。
+        """
+        b = obs_features.size(0)
+        # (B, 34, K)
+        hint_parts = [
+            obs_features[:, s:e].unsqueeze(-1)
+            for _name, s, e in self._direct_hint_ranges
+        ]
+        hints = torch.cat(hint_parts, dim=-1)  # (B, 34, K)
+        tile_ids = self._direct_hint_tile_ids.to(obs_features.device)
+        tile_emb = self.direct_hint_tile_embedding(
+            tile_ids.unsqueeze(0).expand(b, -1)
+        )  # (B, 34, emb)
+        local_input = torch.cat([hints, tile_emb], dim=-1)  # (B, 34, K+emb)
+        delta = self.direct_hint_local_scorer(local_input).squeeze(-1)  # (B,34)
+        gate = torch.sigmoid(self.direct_hint_context_gate(trunk_hidden))
+        return gate * delta
 
 
 # ---------------------------------------------------------------------------

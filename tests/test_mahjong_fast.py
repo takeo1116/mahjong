@@ -3,7 +3,8 @@
 - C++ ``compute_shanten`` / ``find_best_discard`` / ``analyze_discards`` が
   純 Python fallback と代表ケースで一致すること。
 - C++ import unavailable を monkeypatch した fallback でも encoder が動くこと。
-- encoder dim 440 維持。
+- C++ ``compute_shape_hint`` が Python fallback と一致すること。
+- encoder dim (hints_on=506 / hints_off=363) 維持。
 - fast wrapper が hidden state を受け取らない (signature guard)。
 
 C++ extension が未ビルドの環境では equivalence test を skip する
@@ -20,6 +21,11 @@ import pytest
 from mahjong_agent.baseline import _fast
 from mahjong_agent.baseline.discard_select import find_best_discard
 from mahjong_agent.baseline.shanten import compute_shanten, compute_shanten_python
+from mahjong_agent.baseline.shape import (
+    SHAPE_HINT_DIM,
+    compute_shape_hint,
+    compute_shape_hint_python,
+)
 
 _FAST = _fast.FAST_AVAILABLE
 _skip_no_fast = pytest.mark.skipif(
@@ -173,15 +179,59 @@ def test_encoder_fallback_matches_fast(monkeypatch):
 # ----------------------------------------------------------------------
 
 
-def test_encoder_dim_still_440():
+def test_encoder_dim_with_shape_hint():
     from mahjong_agent.encoders.public_observation import (
         PublicObservationEncoder,
     )
 
     enc = PublicObservationEncoder(enable_hints=True)
-    assert enc.metadata().observation_dim == 440
+    # 440 (旧 hints) + shape_hint 66 = 506
+    assert enc.metadata().observation_dim == 506
     enc_off = PublicObservationEncoder(enable_hints=False)
     assert enc_off.metadata().observation_dim == 363
+
+
+# ----------------------------------------------------------------------
+# shape_hint equivalence / sanity
+# ----------------------------------------------------------------------
+
+
+@_skip_no_fast
+def test_cpp_shape_hint_matches_python():
+    rng = random.Random(9)
+    for _ in range(3000):
+        counts = _random_hand(rng, rng.choice([13, 14]))
+        cpp = list(_fast.compute_shape_hint(counts))
+        py = compute_shape_hint_python(counts).tolist()
+        assert cpp == py
+
+
+def test_shape_hint_fallback_when_ext_unavailable(monkeypatch):
+    monkeypatch.setattr(_fast, "FAST_AVAILABLE", False)
+    rng = random.Random(10)
+    for _ in range(300):
+        counts = _random_hand(rng, 14)
+        out = compute_shape_hint(counts)
+        assert out.shape == (SHAPE_HINT_DIM,)
+        np.testing.assert_array_equal(out, compute_shape_hint_python(counts))
+
+
+def test_shape_hint_known_hand():
+    """1m2m3m (chi) + 4p5p (outside_wait) + 7s9s (inside_wait) を検出する。"""
+    counts = [0] * 34
+    counts[0] = 1  # 1m
+    counts[1] = 1  # 2m
+    counts[2] = 1  # 3m  -> man chi center=2m (index 1) → chi[0]
+    counts[12] = 1  # 4p (suit 1, rel 3)
+    counts[13] = 1  # 5p (suit 1, rel 4) -> outside_wait pair_start=3 → idx 8*1+3=11
+    counts[24] = 1  # 7s (suit 2, rel 6)
+    counts[26] = 1  # 9s (suit 2, rel 8) -> inside_wait center=8s(rel7) idx 7*2+6=20
+    out = compute_shape_hint_python(counts)
+    chi, outside_wait, inside_wait = out[:21], out[21:45], out[45:66]
+    assert chi[0] == 1.0  # man 1m2m3m
+    assert chi.sum() == 1.0
+    assert outside_wait[8 * 1 + 3] == 1.0  # 4p5p
+    assert inside_wait[7 * 2 + 6] == 1.0  # 7s_9s kanchan (8s missing)
 
 
 def test_fast_wrapper_signatures_take_only_public_counts():

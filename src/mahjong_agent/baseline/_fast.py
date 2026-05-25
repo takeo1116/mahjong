@@ -59,9 +59,17 @@ def find_best_discard(
     )
 
 
+def compute_shape_hint(counts: Sequence[int]) -> list[float]:
+    """C++ fast path で手牌 shape hint (66 dim) を計算する。"""
+    if _ext is None:
+        raise RuntimeError("_mahjong_fast extension unavailable")
+    return list(_ext.compute_shape_hint([int(x) for x in counts]))
+
+
 __all__ = [
     "FAST_AVAILABLE",
     "analyze_discards",
     "compute_shanten",
+    "compute_shape_hint",
     "find_best_discard",
 ]

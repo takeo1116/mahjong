@@ -9,6 +9,9 @@ Stage03 の module 階層:
 - ``trunk.*``: shared MLP trunk (discard / candidate / value / terminal / yaku
   すべての head が ReLU 経由でここから分岐)。
 - ``discard_head.*`` / ``candidate_scorer.*``: policy 側 head。
+- ``direct_hint_*`` (opt-in, direct hint branch 有効時のみ): per-tile hint を
+  discard logits に直接効かせる tile_embedding / local_scorer / context_gate。
+  policy 経路なので policy group に分類する。
 - ``value_head.*`` / ``terminal_head.*`` / ``yaku_head.*``: value + semantic 側 head。
 - ``semantic_summary_proj.*`` (opt-in, semantic summary injection 有効時のみ):
   policy 経路に summary を入れる射影層。``trunk`` 側に分類する (= 学習速度は
@@ -16,7 +19,9 @@ Stage03 の module 階層:
 
 分類規則 (top-level module 名 → group):
 
-- ``policy``: ``discard_head``, ``candidate_scorer``
+- ``policy``: ``discard_head``, ``candidate_scorer``,
+  ``direct_hint_tile_embedding``, ``direct_hint_local_scorer``,
+  ``direct_hint_context_gate``
 - ``value_semantic``: ``value_head``, ``terminal_head``, ``yaku_head``
 - ``trunk``: ``trunk``, ``semantic_summary_proj``
 - ``default``: 上記いずれにも該当しない trainable parameter (forward-compat)
@@ -33,7 +38,15 @@ from typing import Any
 from torch import nn, optim
 
 # top-level module 名による group 分類規則。
-_POLICY_PREFIXES: tuple[str, ...] = ("discard_head", "candidate_scorer")
+# direct hint branch (tile_embedding / local_scorer / context_gate) は
+# discard logits に直接寄与する policy 経路なので policy group に入れる。
+_POLICY_PREFIXES: tuple[str, ...] = (
+    "discard_head",
+    "candidate_scorer",
+    "direct_hint_tile_embedding",
+    "direct_hint_local_scorer",
+    "direct_hint_context_gate",
+)
 _VALUE_SEMANTIC_PREFIXES: tuple[str, ...] = (
     "value_head",
     "terminal_head",

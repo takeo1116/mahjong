@@ -268,6 +268,47 @@ py::dict py_analyze_discards(const std::vector<int>& counts_vec,
     return d;
 }
 
+// 手牌 shape hint (Stage02 parity): closed chi(21) + outside_wait(24) +
+// inside_wait(21) = 66 dim の binary multihot。数牌のみ対象 (字牌は無視)。
+std::vector<float> py_compute_shape_hint(const std::vector<int>& counts_vec) {
+    auto counts = to_counts(counts_vec);
+    std::vector<float> chi(21, 0.0f);
+    std::vector<float> outside_wait(24, 0.0f);
+    std::vector<float> inside_wait(21, 0.0f);
+    for (int suit = 0; suit < 3; ++suit) {
+        int base = suit * 9;
+        // 順子 (closed_chi): 中心牌 2-8 (index 1-7)
+        for (int center = 1; center <= 7; ++center) {
+            int idx = base + center;
+            if (counts[idx - 1] >= 1 && counts[idx] >= 1 &&
+                counts[idx + 1] >= 1) {
+                chi[suit * 7 + (center - 1)] = 1.0f;
+            }
+        }
+        // 塔子 (closed_outside_wait): 隣接 2 牌 (12, 23, ..., 89)
+        for (int pair_start = 0; pair_start < 8; ++pair_start) {
+            int idx = base + pair_start;
+            if (counts[idx] >= 1 && counts[idx + 1] >= 1) {
+                outside_wait[suit * 8 + pair_start] = 1.0f;
+            }
+        }
+        // 嵌張 (closed_inside_wait): 中心牌 2-8、間が空く
+        for (int center = 1; center <= 7; ++center) {
+            int idx = base + center;
+            if (counts[idx - 1] >= 1 && counts[idx] < 1 &&
+                counts[idx + 1] >= 1) {
+                inside_wait[suit * 7 + (center - 1)] = 1.0f;
+            }
+        }
+    }
+    std::vector<float> out;
+    out.reserve(66);
+    out.insert(out.end(), chi.begin(), chi.end());
+    out.insert(out.end(), outside_wait.begin(), outside_wait.end());
+    out.insert(out.end(), inside_wait.begin(), inside_wait.end());
+    return out;
+}
+
 py::dict py_find_best_discard(const std::vector<int>& counts_vec,
                               const std::vector<int>& mask_vec, int meld_count) {
     auto counts = to_counts(counts_vec);
@@ -333,4 +374,6 @@ PYBIND11_MODULE(_mahjong_fast, m) {
     m.def("find_best_discard", &py_find_best_discard, py::arg("counts"),
           py::arg("legal_mask"), py::arg("meld_count") = 0,
           "合法打牌のうち (shanten 最小, ukeire 最大) を取る集合を返す。");
+    m.def("compute_shape_hint", &py_compute_shape_hint, py::arg("counts"),
+          "手牌 shape hint (chi21 + outside_wait24 + inside_wait21 = 66 dim)。");
 }

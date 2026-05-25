@@ -409,6 +409,33 @@ def test_audit_with_model_family_audit_has_policy_stats():
     assert "policy_selected_prob_stats" in nd
 
 
+def test_audit_candidate_abandon_call_diagnostic():
+    """candidate family の family_audit に call 放棄率 diagnostic が出て、
+    JSON serializable であること。"""
+    import json
+
+    torch.manual_seed(0)
+    model = _build_model()
+    samples = [
+        _make_candidate_sample(
+            family=ActionFamily.CHI, num_cands=3, selected_idx=1, step_id=0
+        ),
+        _make_candidate_sample(
+            family=ActionFamily.PON, num_cands=2, selected_idx=0, step_id=1
+        ),
+    ]
+    summary = audit_decision_samples(samples, model=model)
+    chi = summary.family_audit[ActionFamily.CHI.value]
+    assert "policy_abandon_call_count" in chi
+    assert "policy_abandon_call_total" in chi
+    assert "policy_abandon_call_rate" in chi
+    assert "policy_pred_teacher_candidate_rate" in chi
+    assert chi["policy_abandon_call_total"] == 1
+    assert 0.0 <= chi["policy_abandon_call_rate"] <= 1.0
+    # NORMAL_DISCARD family には abandon 系を出さない
+    json.loads(summary_to_json(summary))
+
+
 def test_audit_with_model_handles_candidate_count_zero_sample():
     """candidate family かつ ``candidate_features.shape[0]==0`` の sample が
     含まれていても model あり audit が crash しない (regression for follow-up #1)。"""

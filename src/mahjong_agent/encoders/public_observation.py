@@ -37,6 +37,7 @@ from mahjong_agent.actions.types import (
 )
 from mahjong_agent.baseline import _fast
 from mahjong_agent.baseline.shanten import compute_shanten
+from mahjong_agent.baseline.shape import compute_shape_hint
 from mahjong_agent.baseline.ukeire import count_acceptance
 from mahjong_agent.encoders.metadata import EncoderMetadata
 
@@ -81,6 +82,8 @@ _NUM_REL_SEATS_PLUS_NONE = _NUM_PLAYERS + 1  # 4 seats + 1 for "none"
 #   turn_progress_norm          :  1  (sum(all discards) / 70)
 #   tile_presence_flags         :  6
 #       has_honor / has_terminal / has_simple / has_man / has_pin / has_sou
+#   shape_hint                  : 66  (closed chi21 + outside_wait24 + inside_wait21)
+#       自手の閉じた順子 / 塔子 / 嵌張 の binary multihot (Stage02 parity)。
 #
 # Note: 旧仕様にあった ``riichi_discard_mask`` (34 dim) は、Stage03 で使う
 # PyPI ``riichienv`` の ``ActionType.RIICHI`` が ``.tile = None`` を返すため
@@ -112,6 +115,8 @@ _BASE_SPEC: tuple[tuple[str, int], ...] = (
     ("riichi_sticks_norm", 1),
 )
 
+_SHAPE_HINT_DIM = 66
+
 _HINT_SPEC: tuple[tuple[str, int], ...] = (
     ("current_shanten_norm", 1),
     ("shanten_delta_per_discard", _NUM_TILE_TYPES),
@@ -119,6 +124,7 @@ _HINT_SPEC: tuple[tuple[str, int], ...] = (
     ("remaining_draws_norm", 1),
     ("turn_progress_norm", 1),
     ("tile_presence_flags", 6),
+    ("shape_hint", _SHAPE_HINT_DIM),
 )
 
 # tile_presence_flags の内訳 (固定順)
@@ -495,6 +501,10 @@ class PublicObservationEncoder:
         # 6) tile_presence_flags
         flags = _tile_presence_flags(hand_counts_list)
         _set_range(feat, self._obs_ranges, "tile_presence_flags", flags)
+
+        # 7) shape_hint (Stage02 parity): 閉じた順子 / 塔子 / 嵌張 の multihot
+        shape = compute_shape_hint(hand_counts_list)
+        _set_range(feat, self._obs_ranges, "shape_hint", shape)
 
     # ------------------------------------------------------------------
     # legal mask

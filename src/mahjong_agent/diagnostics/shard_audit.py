@@ -425,6 +425,11 @@ def _aggregate_family_audit(
         policy_entropies: list[float] = []
         policy_max_probs: list[float] = []
         policy_selected_probs: list[float] = []
+        # candidate 局面で model が call を放棄して discard に倒した回数
+        # (= teacher=call なのに model argmax が discard 領域)。
+        abandon_count = 0  # argmax が discard 領域だった candidate sample 数
+        pred_teacher_cand_count = 0  # argmax が teacher の選んだ candidate
+        abandon_total = 0  # policy 評価できた candidate sample 数
         for i, s in pairs:
             actor_counter[str(s.actor_type)] += 1
             if family == _NORMAL_DISCARD_FAMILY:
@@ -452,6 +457,12 @@ def _aggregate_family_audit(
                 policy_selected_probs.append(
                     float(ps.get("selected_prob", 0.0))
                 )
+                if family != _NORMAL_DISCARD_FAMILY:
+                    abandon_total += 1
+                    if float(ps.get("argmax_in_candidate_region", 1.0)) < 0.5:
+                        abandon_count += 1
+                    if float(ps.get("argmax_is_teacher_candidate", 0.0)) > 0.5:
+                        pred_teacher_cand_count += 1
         entry: dict[str, Any] = {
             "count": int(len(pairs)),
             "candidate_count_stats": _basic_stats(cand_counts),
@@ -472,6 +483,19 @@ def _aggregate_family_audit(
             entry["policy_selected_prob_stats"] = _basic_stats(
                 policy_selected_probs
             )
+            # candidate family のみ: call 放棄 / teacher candidate 一致の率。
+            if family != _NORMAL_DISCARD_FAMILY and abandon_total > 0:
+                entry["policy_abandon_call_count"] = int(abandon_count)
+                entry["policy_abandon_call_total"] = int(abandon_total)
+                entry["policy_abandon_call_rate"] = (
+                    float(abandon_count) / float(abandon_total)
+                )
+                entry["policy_pred_teacher_candidate_count"] = int(
+                    pred_teacher_cand_count
+                )
+                entry["policy_pred_teacher_candidate_rate"] = (
+                    float(pred_teacher_cand_count) / float(abandon_total)
+                )
         by_family[family] = entry
     return by_family
 
@@ -649,10 +673,27 @@ def _evaluate_policy(
                             sel_prob = float(
                                 combined_row[_NUM_TILE_TYPES + sel].item()
                             )
+                        # combined argmax が discard 領域 (<34) に落ちると、
+                        # candidate 局面で model が「call を取らず打牌に倒す」
+                        # ことを意味する (= teacher=chi なのに model=discard/pass
+                        # の検出に使う)。
+                        argmax_idx = int(combined_row.argmax().item())
+                        argmax_in_candidate = argmax_idx >= _NUM_TILE_TYPES
+                        argmax_is_teacher_cand = (
+                            argmax_in_candidate
+                            and (argmax_idx - _NUM_TILE_TYPES) == sel
+                            and 0 <= sel < cprobs.numel()
+                        )
                         per_sample[global_idx] = {
                             "entropy": c_entropy,
                             "max_prob": c_maxp,
                             "selected_prob": sel_prob,
+                            "argmax_in_candidate_region": float(
+                                argmax_in_candidate
+                            ),
+                            "argmax_is_teacher_candidate": float(
+                                argmax_is_teacher_cand
+                            ),
                         }
                         if 0 <= sel < cprobs.numel():
                             selected_probs.append(sel_prob)
