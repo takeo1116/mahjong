@@ -114,6 +114,10 @@ class Stage03ModelConfig:
         direct_hint_sources: tuple[str, ...] = (
             "shanten_delta_per_discard",
             "discard_ukeire_per_tile",
+            # defensive direct hints (riichi 守備)
+            "safe_vs_all_riichi_mask",
+            "suji_vs_all_riichi_mask",
+            "kabe_suji_mask",
         ),
     ) -> Stage03ModelConfig:
         """``EncoderMetadata`` から observation_dim / candidate_dim を引き継いで config を作る。

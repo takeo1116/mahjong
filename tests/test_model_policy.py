@@ -539,3 +539,99 @@ def test_self_play_runner_rejects_observation_feat_wrong_type():
     assert res.crash_context is not None
     err = str(res.crash_context.get("error_message", ""))
     assert "observation_feat" in err
+
+
+# ----------------------------------------------------------------------
+# sampling fallback illegal-discard regression (ISSUE-0021)
+# ----------------------------------------------------------------------
+
+
+def _nd_action(tile_type: int, actor: int = 0) -> ModelAction:
+    return ModelAction(
+        key=ActionKey(family=ActionFamily.NORMAL_DISCARD, tile_type=tile_type),
+        actor=actor,
+        _raw_actions=(),
+    )
+
+
+class _HighRng:
+    """常に 1.0 を返す rng。cumulative sampling の fallback 経路を強制する。"""
+
+    def random(self) -> float:
+        return 1.0
+
+
+def test_sampling_fallback_picks_legal_index_not_illegal_last():
+    """legal discard が {5,7} (idx 33 は illegal) のとき、rng が cumsum を
+    超えても fallback が illegal な末尾 index (33) ではなく legal index を選ぶ。
+    旧実装の `idx = len(probs)-1` バグの regression。"""
+    encoder, model = _build_encoder_model()
+    agent = ModelPolicyAgent(
+        model, encoder, ModelPolicyConfig(greedy=False), seed=0
+    )
+    env = riichienv.RiichiEnv(riichienv.GameType.YON_IKKYOKU)
+    env.reset(seed=0)
+    cp = env.current_player
+    obs = env.get_observation(cp)
+    # idx 33 を含まない legal discard set (no candidates → combined 末尾=33 が illegal)
+    legal_set = LegalActionSet(
+        decision_player=cp,
+        normal_discard={5: _nd_action(5, cp), 7: _nd_action(7, cp)},
+        candidates=(),
+    )
+    # rng が 1.0 を返し cumsum を超える → fallback 経路
+    dec = agent.select_action(
+        legal_set, observation=obs, rng=_HighRng()
+    )
+    assert dec.family == ActionFamily.NORMAL_DISCARD
+    assert dec.tile_type in {5, 7}  # legal のみ、33 ではない
+    assert dec.action.key.tile_type != 33
+
+
+def test_sampling_only_picks_legal_across_many_rng_values():
+    """様々な rng 値で sampling しても、常に legal discard のみ選ばれる
+    (illegal index を踏まない)。"""
+    encoder, model = _build_encoder_model()
+    agent = ModelPolicyAgent(
+        model, encoder, ModelPolicyConfig(greedy=False), seed=0
+    )
+    env = riichienv.RiichiEnv(riichienv.GameType.YON_IKKYOKU)
+    env.reset(seed=0)
+    cp = env.current_player
+    obs = env.get_observation(cp)
+    legal_tts = {3, 5, 7, 11}
+    legal_set = LegalActionSet(
+        decision_player=cp,
+        normal_discard={tt: _nd_action(tt, cp) for tt in legal_tts},
+        candidates=(),
+    )
+
+    class _FixedRng:
+        def __init__(self, v: float):
+            self._v = v
+
+        def random(self) -> float:
+            return self._v
+
+    # 0.0, ~1.0, 境界付近を含む様々な r で legal のみ選ばれること
+    for v in (0.0, 0.25, 0.5, 0.75, 0.999999, 1.0):
+        dec = agent.select_action(legal_set, observation=obs, rng=_FixedRng(v))
+        assert dec.family == ActionFamily.NORMAL_DISCARD
+        assert dec.tile_type in legal_tts
+
+
+def test_sampling_degenerate_distribution_fail_fast():
+    """combined_mask が全 0 相当 (legal action 無し) は fail-fast する。"""
+    encoder, model = _build_encoder_model()
+    agent = ModelPolicyAgent(
+        model, encoder, ModelPolicyConfig(greedy=False), seed=0
+    )
+    env = riichienv.RiichiEnv(riichienv.GameType.YON_IKKYOKU)
+    env.reset(seed=0)
+    cp = env.current_player
+    obs = env.get_observation(cp)
+    legal_set = LegalActionSet(
+        decision_player=cp, normal_discard={}, candidates=()
+    )
+    with pytest.raises(ValueError):
+        agent.select_action(legal_set, observation=obs)

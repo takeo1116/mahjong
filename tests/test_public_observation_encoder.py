@@ -329,3 +329,167 @@ def test_module_imports():
 
 # linter 用に未使用 import を避ける
 _ = pytest
+
+
+# ----------------------------------------------------------------------
+# candidate safety scalars (ISSUE-0023)
+# ----------------------------------------------------------------------
+
+_CAND_SAFETY_NAMES = (
+    "candidate_shanten_delta",
+    "candidate_ukeire_norm",
+    "candidate_safe_vs_all_riichi",
+    "candidate_suji_vs_all_riichi",
+    "candidate_kabe_suji",
+)
+_CAND_SAFETY_SRC = {
+    "candidate_shanten_delta": "shanten_delta_per_discard",
+    "candidate_ukeire_norm": "discard_ukeire_per_tile",
+    "candidate_safe_vs_all_riichi": "safe_vs_all_riichi_mask",
+    "candidate_suji_vs_all_riichi": "suji_vs_all_riichi_mask",
+    "candidate_kabe_suji": "kabe_suji_mask",
+}
+
+
+def _cand(family, tile_type=None):
+    from mahjong_agent.actions.types import ActionFamily, ActionKey, ModelAction
+
+    return ModelAction(
+        key=ActionKey(family=getattr(ActionFamily, family), tile_type=tile_type),
+        actor=0,
+        _raw_actions=(),
+    )
+
+
+def test_candidate_safety_scalars_in_ranges_and_dim():
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    meta = PublicObservationEncoder().metadata()
+    cr = meta.candidate_feature_ranges
+    for name in _CAND_SAFETY_NAMES:
+        assert name in cr
+        s, e = cr[name]
+        assert e - s == 1
+    # 末尾 append: 5 scalar が target_rel_seat_one_hot の直後から連続
+    after = cr["target_rel_seat_one_hot"][1]
+    cur = after
+    for name in _CAND_SAFETY_NAMES:
+        assert cr[name] == (cur, cur + 1)
+        cur += 1
+    assert cur == meta.candidate_dim
+    # candidate_dim == old(86) + 5
+    assert meta.candidate_dim == 91
+
+
+def test_candidate_safety_lookup_matches_observation_feat():
+    from mahjong_agent.actions.types import LegalActionSet
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder()
+    meta = enc.metadata()
+    # known observation_feat: hint range の index 5 に distinct value
+    feat = np.zeros(meta.observation_dim, dtype=np.float32)
+    expected = {
+        "shanten_delta_per_discard": 0.7,
+        "discard_ukeire_per_tile": 0.3,
+        "safe_vs_all_riichi_mask": 1.0,
+        "suji_vs_all_riichi_mask": 1.0,
+        "kabe_suji_mask": 1.0,
+    }
+    for hint, val in expected.items():
+        s, _e = meta.feature_ranges[hint]
+        feat[s + 5] = val
+    cand = _cand("RIICHI_DISCARD", tile_type=5)
+    lset = LegalActionSet(decision_player=0, normal_discard={}, candidates=(cand,))
+    out = enc.encode_candidates(lset, observation_feat=feat)
+    cr = meta.candidate_feature_ranges
+    for cand_name, src in _CAND_SAFETY_SRC.items():
+        s, _e = cr[cand_name]
+        assert out[0, s] == pytest.approx(expected[src], abs=1e-6)
+
+
+def test_candidate_safety_zero_when_no_tile_type():
+    from mahjong_agent.actions.types import LegalActionSet
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder()
+    meta = enc.metadata()
+    feat = np.ones(meta.observation_dim, dtype=np.float32)  # 全 1
+    cand = _cand("PASS", tile_type=None)
+    lset = LegalActionSet(decision_player=0, normal_discard={}, candidates=(cand,))
+    out = enc.encode_candidates(lset, observation_feat=feat)
+    cr = meta.candidate_feature_ranges
+    for name in _CAND_SAFETY_NAMES:
+        s, _e = cr[name]
+        assert out[0, s] == 0.0
+
+
+def test_candidate_safety_zero_when_no_observation():
+    """observation_feat / observation どちらも無い従来呼び出しは all-zero fallback。"""
+    from mahjong_agent.actions.types import LegalActionSet
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder()
+    meta = enc.metadata()
+    cand = _cand("RIICHI_DISCARD", tile_type=5)
+    lset = LegalActionSet(decision_player=0, normal_discard={}, candidates=(cand,))
+    out = enc.encode_candidates(lset)  # 従来 API
+    cr = meta.candidate_feature_ranges
+    for name in _CAND_SAFETY_NAMES:
+        s, _e = cr[name]
+        assert out[0, s] == 0.0
+
+
+def test_candidate_safety_observation_feat_shape_mismatch_raises():
+    from mahjong_agent.actions.types import LegalActionSet
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder()
+    cand = _cand("RIICHI_DISCARD", tile_type=5)
+    lset = LegalActionSet(decision_player=0, normal_discard={}, candidates=(cand,))
+    with pytest.raises(ValueError):
+        enc.encode_candidates(
+            lset, observation_feat=np.zeros(10, dtype=np.float32)
+        )
+
+
+def test_candidate_safety_hints_off_zero_fallback():
+    """enable_hints=False では hint range が無く全 scalar 0.0、dim は同じ。"""
+    from mahjong_agent.actions.types import LegalActionSet
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder(enable_hints=False)
+    meta = enc.metadata()
+    assert meta.candidate_dim == 91  # candidate_dim は hints 有無で不変
+    feat = np.ones(meta.observation_dim, dtype=np.float32)
+    cand = _cand("RIICHI_DISCARD", tile_type=5)
+    lset = LegalActionSet(decision_player=0, normal_discard={}, candidates=(cand,))
+    out = enc.encode_candidates(lset, observation_feat=feat)
+    cr = meta.candidate_feature_ranges
+    for name in _CAND_SAFETY_NAMES:
+        s, _e = cr[name]
+        assert out[0, s] == 0.0
+
+
+def test_candidate_safety_observation_arg_path():
+    """observation_feat の代わりに observation を渡しても lookup される。"""
+    import riichienv
+
+    from mahjong_agent.actions import legal_actions_to_model_set
+    from mahjong_agent.encoders import PublicObservationEncoder
+
+    enc = PublicObservationEncoder()
+    env = riichienv.RiichiEnv(riichienv.GameType.YON_TONPUSEN)
+    env.reset(seed=3)
+    cp = env.current_player
+    obs = env.get_observation(cp)
+    legal_set = legal_actions_to_model_set(
+        list(obs.legal_actions()), actor=cp, num_players=env.num_players,
+        env_for_riichi=env,
+    )
+    # observation 引数経路と observation_feat 経路が一致すること
+    feat = enc.encode_observation(obs)
+    out_a = enc.encode_candidates(legal_set, observation=obs)
+    out_b = enc.encode_candidates(legal_set, observation_feat=feat)
+    assert np.array_equal(out_a, out_b)
+    assert out_a.shape == (len(legal_set.candidates), enc.metadata().candidate_dim)

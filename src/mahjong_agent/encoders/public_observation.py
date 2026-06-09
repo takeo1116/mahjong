@@ -125,6 +125,10 @@ _HINT_SPEC: tuple[tuple[str, int], ...] = (
     ("turn_progress_norm", 1),
     ("tile_presence_flags", 6),
     ("shape_hint", _SHAPE_HINT_DIM),
+    # defensive direct hints: 立直相手への守備 mask (現物 / 保守的 suji / 壁筋)。末尾 append。
+    ("safe_vs_all_riichi_mask", _NUM_TILE_TYPES),
+    ("suji_vs_all_riichi_mask", _NUM_TILE_TYPES),
+    ("kabe_suji_mask", _NUM_TILE_TYPES),
 )
 
 # tile_presence_flags の内訳 (固定順)
@@ -160,6 +164,20 @@ def _build_observation_layout(
     return cursor, ranges
 
 
+# candidate safety scalars: (candidate feature 名, 参照する observation hint 名)。
+# candidate の tile_type に対応する observation hint value を action-local
+# scalar として candidate feature 末尾に append する (discard direct hint と
+# 同種情報を candidate scorer にも与える)。observation hint が無い
+# (enable_hints=False / tile_type=None) 場合は 0.0 fallback。
+_CANDIDATE_SAFETY_SPEC: tuple[tuple[str, str], ...] = (
+    ("candidate_shanten_delta", "shanten_delta_per_discard"),
+    ("candidate_ukeire_norm", "discard_ukeire_per_tile"),
+    ("candidate_safe_vs_all_riichi", "safe_vs_all_riichi_mask"),
+    ("candidate_suji_vs_all_riichi", "suji_vs_all_riichi_mask"),
+    ("candidate_kabe_suji", "kabe_suji_mask"),
+)
+
+
 def _build_candidate_layout() -> tuple[int, dict[str, tuple[int, int]]]:
     """candidate feature の dim と feature_ranges を組み立てる。"""
     spec: list[tuple[str, int]] = [
@@ -169,6 +187,8 @@ def _build_candidate_layout() -> tuple[int, dict[str, tuple[int, int]]]:
         ("consume_tile_type_counts", _NUM_TILE_TYPES),
         ("target_rel_seat_one_hot", _NUM_REL_SEATS_PLUS_NONE),
     ]
+    # candidate safety scalars (末尾 append、各 1 dim)
+    spec.extend((name, 1) for name, _src in _CANDIDATE_SAFETY_SPEC)
     ranges: dict[str, tuple[int, int]] = {}
     cursor = 0
     for name, dim in spec:
@@ -215,6 +235,153 @@ def _opponent_rel_seat_order(num_players: int, player_id: int) -> list[int]:
     return [(player_id + off) % num_players for off in range(1, num_players)]
 
 
+# tile_type index: man 0-8 (1m-9m), pin 9-17, sou 18-26, honor 27-33。
+_SUIT_BASES: tuple[int, ...] = (0, 9, 18)
+
+
+def _genbutsu_set(discard_tile_ids) -> set[int]:
+    """その相手の **自分の河** に出ている tile_type 集合 (= 現物)。
+
+    立直者は自分が捨てた牌種ではロンできない (永続フリテン) ため、相手の河に
+    ある牌種はその相手に対して 100% 安全。public-only (obs.discards[opp])。
+
+    Note: 「立直宣言後に第三者が通した牌」も理論上は安全だが、PyPI riichienv の
+    Stage03 経路では立直宣言巡目を確実に取得できない (``riichi_sutehais`` が
+    二段階 (Riichi, Discard) action 経由では None のまま; riichi 宣言牌が観測
+    から復元できない既知の制約と同根)。曖昧推測で hidden state を使わない
+    ため、ここでは own-river genbutsu に限定する。これは安全側に過小評価する
+    だけで、危険牌を安全と誤判定することはない (= direct hint に入れて安全)。
+    """
+    out: set[int] = set()
+    if not discard_tile_ids:
+        return out
+    for tid in discard_tile_ids:
+        tt = tile_id_to_type(int(tid))
+        if 0 <= tt < _NUM_TILE_TYPES:
+            out.add(tt)
+    return out
+
+
+def _suji_from_safe_set(safe: set[int]) -> np.ndarray:
+    """1 相手の safe 集合から保守的 suji mask ``(34,)`` を作る。
+
+    数牌のみ。**片スジは採用しない** (両面待ちに対して安全と言い切れないため)。
+    - 外側筋: 中央牌 (4/5/6) が safe → 同色の外側 (1,7 / 2,8 / 3,9) を suji。
+    - 中筋: 外側 2 枚が **両方** safe (1&7 / 2&8 / 3&9) → 中央 (4/5/6) を suji。
+    """
+    mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+    for base in _SUIT_BASES:
+        # 外側筋 (center safe -> outers suji)
+        if (base + 3) in safe:  # 4
+            mask[base + 0] = 1.0  # 1
+            mask[base + 6] = 1.0  # 7
+        if (base + 4) in safe:  # 5
+            mask[base + 1] = 1.0  # 2
+            mask[base + 7] = 1.0  # 8
+        if (base + 5) in safe:  # 6
+            mask[base + 2] = 1.0  # 3
+            mask[base + 8] = 1.0  # 9
+        # 中筋 (both outers safe -> center suji)
+        if (base + 0) in safe and (base + 6) in safe:  # 1 & 7
+            mask[base + 3] = 1.0  # 4
+        if (base + 1) in safe and (base + 7) in safe:  # 2 & 8
+            mask[base + 4] = 1.0  # 5
+        if (base + 2) in safe and (base + 8) in safe:  # 3 & 9
+            mask[base + 5] = 1.0  # 6
+    return mask
+
+
+def _active_riichi_opponents(obs: Any, player_id: int, num_players: int) -> list[int]:
+    """自分以外で立直宣言済みの絶対 seat list。"""
+    riichi = obs.riichi_declared if obs.riichi_declared else []
+    out: list[int] = []
+    for pid in range(num_players):
+        if pid == player_id:
+            continue
+        if pid < len(riichi) and bool(riichi[pid]):
+            out.append(pid)
+    return out
+
+
+def _compute_riichi_safe_masks(
+    obs: Any, player_id: int, num_players: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """active riichi opponent **全員に対して** 安全な現物 / 保守的 suji mask。
+
+    Returns
+    -------
+    (safe_mask, suji_mask):
+        各 ``(34,) float32``。active riichi opponent がいなければ両方 all-zero。
+        複数立直者がいる場合は **全員に対する AND** (OR で過大評価しない)。
+    """
+    safe_mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+    suji_mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+    opps = _active_riichi_opponents(obs, player_id, num_players)
+    if not opps:
+        return safe_mask, suji_mask
+    discards = obs.discards if obs.discards else []
+    per_opp_safe: list[np.ndarray] = []
+    per_opp_suji: list[np.ndarray] = []
+    for opp in opps:
+        opp_discards = discards[opp] if opp < len(discards) else []
+        safe_set = _genbutsu_set(opp_discards)
+        s = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+        for tt in safe_set:
+            s[tt] = 1.0
+        per_opp_safe.append(s)
+        per_opp_suji.append(_suji_from_safe_set(safe_set))
+    # AND across all active riichi opponents
+    safe_and = per_opp_safe[0].copy()
+    suji_and = per_opp_suji[0].copy()
+    for s in per_opp_safe[1:]:
+        safe_and *= s
+    for s in per_opp_suji[1:]:
+        suji_and *= s
+    return safe_and, suji_and
+
+
+def _visible_tile_counts(obs: Any, player_id: int, num_players: int) -> np.ndarray:
+    """見えている牌の tile_type counts (自手 + 全河 + 全副露 + ドラ表示)。
+
+    public-only。自手は ``obs.hand`` のみ参照し、他家手牌 slot には触らない。
+    """
+    counts = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+    counts += _tile_id_list_to_counts(obs.hand)
+    discards = obs.discards if obs.discards else []
+    melds = obs.melds if obs.melds else []
+    for pid in range(num_players):
+        if pid < len(discards):
+            counts += _tile_id_list_to_counts(discards[pid])
+        if pid < len(melds):
+            for meld in melds[pid]:
+                counts += _tile_id_list_to_counts(_meld_tile_ids(meld))
+    if obs.dora_indicators:
+        counts += _tile_id_list_to_counts(obs.dora_indicators)
+    return counts
+
+
+def _compute_kabe_suji_mask(obs: Any, num_players: int) -> np.ndarray:
+    """壁筋 mask ``(34,)``。
+
+    中央数牌 4/5/6 が **4 枚見え** のとき、同色の外側筋 (1,7 / 2,8 / 3,9) を 1。
+    完全安全ではなく「両面待ちに対して比較的安全な壁筋」を表す。**2/3/7/8 等
+    単独壁からの片側筋は採用しない** (保守的)。字牌は常に 0。
+    """
+    mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+    visible = _visible_tile_counts(obs, int(obs.player_id), num_players)
+    for base in _SUIT_BASES:
+        if visible[base + 3] >= 4:  # 4 が4枚見え
+            mask[base + 0] = 1.0  # 1
+            mask[base + 6] = 1.0  # 7
+        if visible[base + 4] >= 4:  # 5
+            mask[base + 1] = 1.0  # 2
+            mask[base + 7] = 1.0  # 8
+        if visible[base + 5] >= 4:  # 6
+            mask[base + 2] = 1.0  # 3
+            mask[base + 8] = 1.0  # 9
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
@@ -223,9 +390,9 @@ def _opponent_rel_seat_order(num_players: int, player_id: int) -> list[int]:
 class PublicObservationEncoder:
     """Public-only observation / candidate / legal-mask encoder (v2)。
 
-    ``enable_hints=True`` (default) で shanten / ukeire / riichi-discard-mask
-    / 残り山 / 牌種分布 等の public hint feature を追加する。off にすると
-    base layout のみで legacy compat 互換動作。
+    ``enable_hints=True`` (default) で shanten / ukeire / shape / defensive
+    direct hints / 残り山 / 牌種分布 等の public hint feature を追加する。off
+    にすると base layout のみで legacy compat 互換動作。
 
     Output は np.float32 固定長。``metadata()`` で各 feature の range を
     返す。``Stage03ModelConfig.from_encoder_metadata(encoder.metadata())``
@@ -506,6 +673,15 @@ class PublicObservationEncoder:
         shape = compute_shape_hint(hand_counts_list)
         _set_range(feat, self._obs_ranges, "shape_hint", shape)
 
+        # 8) defensive direct hints: 立直相手への守備 mask
+        safe_mask, suji_mask = _compute_riichi_safe_masks(
+            obs, int(obs.player_id), self._num_players
+        )
+        kabe_mask = _compute_kabe_suji_mask(obs, self._num_players)
+        _set_range(feat, self._obs_ranges, "safe_vs_all_riichi_mask", safe_mask)
+        _set_range(feat, self._obs_ranges, "suji_vs_all_riichi_mask", suji_mask)
+        _set_range(feat, self._obs_ranges, "kabe_suji_mask", kabe_mask)
+
     # ------------------------------------------------------------------
     # legal mask
     # ------------------------------------------------------------------
@@ -522,8 +698,74 @@ class PublicObservationEncoder:
     # candidate feature
     # ------------------------------------------------------------------
 
-    def encode_candidate(self, candidate: ModelAction) -> np.ndarray:
-        """1 candidate を ``(candidate_dim,)`` float32 に変換する。"""
+    def _resolve_observation_feat(
+        self,
+        observation: Any | None,
+        observation_feat: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """candidate safety scalar lookup 用の observation feature を解決する。
+
+        - ``observation_feat`` が渡されたら shape を検証して使う (再 encode しない)。
+        - 無く ``observation`` が渡されたら ``encode_observation`` で作る。
+        - どちらも無ければ ``None`` (= 5 scalar all-zero fallback)。
+        - ``observation_feat`` の shape が ``observation_dim`` と不一致なら
+          ``ValueError`` で fail-fast (silent corruption を防ぐ)。
+        """
+        if observation_feat is not None:
+            arr = np.asarray(observation_feat, dtype=np.float32).reshape(-1)
+            if arr.shape != (self._obs_dim,):
+                raise ValueError(
+                    f"observation_feat shape {arr.shape} mismatches "
+                    f"observation_dim ({self._obs_dim},)"
+                )
+            return arr
+        if observation is not None:
+            return self.encode_observation(observation)
+        return None
+
+    def _candidate_safety_scalars(
+        self, tile_type: int | None, obs_feat: np.ndarray | None
+    ) -> dict[str, float]:
+        """candidate tile_type に対応する observation hint scalar を引く。
+
+        tile_type が無い / obs_feat が無い / hint range が無い (enable_hints=False)
+        場合は 0.0。hidden info には触れず、既存 public observation hint の
+        該当 index を読むだけ。
+        """
+        out: dict[str, float] = {name: 0.0 for name, _src in _CANDIDATE_SAFETY_SPEC}
+        if obs_feat is None:
+            return out
+        if tile_type is None or not (0 <= int(tile_type) < _NUM_TILE_TYPES):
+            return out
+        tt = int(tile_type)
+        for cand_name, hint_name in _CANDIDATE_SAFETY_SPEC:
+            rng = self._obs_ranges.get(hint_name)
+            if rng is None:
+                continue  # enable_hints=False では hint range が無い → 0.0
+            s, _e = rng
+            out[cand_name] = float(obs_feat[s + tt])
+        return out
+
+    def encode_candidate(
+        self,
+        candidate: ModelAction,
+        *,
+        observation: Any | None = None,
+        observation_feat: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """1 candidate を ``(candidate_dim,)`` float32 に変換する。
+
+        ``observation`` / ``observation_feat`` のいずれかが渡された場合、
+        candidate の ``tile_type`` に対応する observation hint
+        (shanten_delta / ukeire / safe / suji / kabe) を action-local scalar
+        として末尾に埋める。どちらも無ければ 5 scalar は 0.0 fallback。
+        """
+        obs_feat = self._resolve_observation_feat(observation, observation_feat)
+        return self._encode_candidate_with_feat(candidate, obs_feat)
+
+    def _encode_candidate_with_feat(
+        self, candidate: ModelAction, obs_feat: np.ndarray | None
+    ) -> np.ndarray:
         feat = np.zeros(_CAND_DIM, dtype=np.float32)
         # family one-hot
         family_one_hot = np.zeros(_NUM_FAMILIES, dtype=np.float32)
@@ -556,17 +798,33 @@ class PublicObservationEncoder:
             else:
                 rel_one_hot[_NUM_PLAYERS] = 1.0
         _set_range(feat, _CAND_RANGES, "target_rel_seat_one_hot", rel_one_hot)
+        # candidate safety scalars (tile_type に対応する observation hint lookup)
+        scalars = self._candidate_safety_scalars(candidate.key.tile_type, obs_feat)
+        for cand_name, _src in _CANDIDATE_SAFETY_SPEC:
+            _set_range(
+                feat, _CAND_RANGES, cand_name,
+                np.array([scalars[cand_name]], dtype=np.float32),
+            )
         return feat
 
-    def encode_candidates(self, legal_set: LegalActionSet) -> np.ndarray:
+    def encode_candidates(
+        self,
+        legal_set: LegalActionSet,
+        *,
+        observation: Any | None = None,
+        observation_feat: np.ndarray | None = None,
+    ) -> np.ndarray:
         """``legal_set.candidates`` を ``(num_candidates, candidate_dim)`` に変換する。
 
         candidate が 0 個のときは ``(0, candidate_dim)`` を返す。
+        ``observation`` / ``observation_feat`` を渡すと candidate safety scalar
+        が埋まる (1 回だけ resolve して全 candidate で再利用)。
         """
+        obs_feat = self._resolve_observation_feat(observation, observation_feat)
         n = len(legal_set.candidates)
         out = np.zeros((n, _CAND_DIM), dtype=np.float32)
         for i, c in enumerate(legal_set.candidates):
-            out[i] = self.encode_candidate(c)
+            out[i] = self._encode_candidate_with_feat(c, obs_feat)
         return out
 
 

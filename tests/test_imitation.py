@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 from mahjong_agent.actions.types import ActionFamily
 from mahjong_agent.data import (
@@ -697,3 +698,223 @@ def test_same_seed_gives_same_epoch_metrics():
     r2 = run()
     assert r1.final.loss == pytest.approx(r2.final.loss, rel=1e-6, abs=1e-6)
     assert r1.final.num_samples == r2.final.num_samples
+
+
+# ----------------------------------------------------------------------
+# combined imitation loss (policy_loss_mode="combined")
+# ----------------------------------------------------------------------
+
+
+def _make_discard_sample_with_cands(
+    *,
+    tile_type: int,
+    legal_tiles: tuple[int, ...],
+    num_cands: int,
+    step_id: int = 0,
+) -> DecisionSample:
+    """discard sample だが riichi/kan 等の candidate が co-legal なケース。
+
+    selected_discard_tile_type を取り、candidate_features は非空 (= combined
+    softmax で candidate mass も denominator に入る)。
+    """
+    obs = np.full(_OBS_DIM, 1.0, dtype=np.float32)
+    mask = np.zeros(34, dtype=np.float32)
+    for t in legal_tiles:
+        mask[int(t)] = 1.0
+    cand = np.zeros((num_cands, _CAND_DIM), dtype=np.float32)
+    for i in range(num_cands):
+        cand[i, i % _CAND_DIM] = 1.0
+    return DecisionSample(
+        schema_version=SCHEMA_VERSION,
+        episode_id="syn",
+        round_id=0,
+        step_id=step_id,
+        player_id=0,
+        decision_family=ActionFamily.NORMAL_DISCARD.value,
+        actor_type="rule_based",
+        observation=obs,
+        discard_mask=mask,
+        candidate_features=cand,
+        selected_discard_tile_type=int(tile_type),
+        selected_candidate_index=-1,
+        yaku_target=np.zeros(NUM_YAKU, dtype=np.float32),
+    )
+
+
+def _combined_logits(model, batch) -> torch.Tensor:
+    """model から [masked discard 34, masked candidate Cmax] の combined logits。"""
+    obs = batch.observation.float()
+    dmask = batch.discard_mask.float()
+    fwd = model(obs, discard_mask=dmask)
+    cscore = model.score_candidates(obs, batch.candidate_features.float())
+    cs = cscore.candidate_scores
+    if cs.size(1) > 0:
+        masked_cand = cs + (1.0 - batch.candidate_mask.float()) * -1.0e9
+    else:
+        masked_cand = cs
+    return torch.cat([fwd.discard_logits, masked_cand], dim=-1)
+
+
+def test_combined_discard_ce_matches_manual_formula():
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_discard_sample_with_cands(
+        tile_type=5, legal_tiles=(3, 5, 7), num_cands=2
+    )
+    batch = collate_decision_samples([s])
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0, policy_loss_mode="combined"
+    )
+    _, metrics = compute_imitation_loss(model, batch, cfg)
+    with torch.no_grad():
+        combined = _combined_logits(model, batch)
+        expected = float(
+            -F.log_softmax(combined, dim=-1)[0, 5].item()
+        )
+    assert metrics.discard_count == 1
+    assert metrics.discard_loss == pytest.approx(expected, abs=1e-5)
+
+
+def test_combined_discard_target_penalizes_candidate_mass():
+    """同じ discard target で、candidate score を上げると combined discard loss が
+    増えること (teacher=normal_discard なのに candidate に確率を置く罰)。"""
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_discard_sample_with_cands(
+        tile_type=5, legal_tiles=(3, 5, 7), num_cands=2
+    )
+    batch = collate_decision_samples([s])
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0, policy_loss_mode="combined"
+    )
+    _, m_base = compute_imitation_loss(model, batch, cfg)
+    # candidate scorer の最終 Linear bias を持ち上げ candidate scores を上げる
+    with torch.no_grad():
+        last = model.candidate_scorer[-1]
+        last.bias.add_(10.0)
+    _, m_high = compute_imitation_loss(model, batch, cfg)
+    assert m_high.discard_loss > m_base.discard_loss
+
+
+def test_combined_tie_aware_matches_manual_formula():
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_discard_sample_with_cands(
+        tile_type=5, legal_tiles=(3, 5, 7), num_cands=2
+    )
+    # teacher_best_mask = {3, 5}
+    tbm = np.zeros(34, dtype=np.float32)
+    tbm[3] = 1.0
+    tbm[5] = 1.0
+    s.teacher_best_mask = tbm
+    batch = collate_decision_samples([s])
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0,
+        policy_loss_mode="combined", tie_aware_discard=True,
+    )
+    _, metrics = compute_imitation_loss(model, batch, cfg)
+    with torch.no_grad():
+        combined = _combined_logits(model, batch)
+        lsm = F.log_softmax(combined, dim=-1)[0]
+        # -log(p[3] + p[5]) on combined softmax
+        expected = float(
+            -torch.logsumexp(torch.stack([lsm[3], lsm[5]]), dim=0).item()
+        )
+    assert metrics.discard_loss == pytest.approx(expected, abs=1e-5)
+
+
+def test_combined_candidate_ce_matches_manual_formula():
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_candidate_sample(selected_index=1, num_cands=3)
+    batch = collate_decision_samples([s])
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0, policy_loss_mode="combined"
+    )
+    _, metrics = compute_imitation_loss(model, batch, cfg)
+    with torch.no_grad():
+        combined = _combined_logits(model, batch)
+        expected = float(
+            -F.log_softmax(combined, dim=-1)[0, 34 + 1].item()
+        )
+    assert metrics.candidate_count == 1
+    assert metrics.candidate_loss == pytest.approx(expected, abs=1e-5)
+
+
+def test_combined_mode_padding_and_zero_candidate_safety():
+    torch.manual_seed(0)
+    model = _build_model()
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0, policy_loss_mode="combined"
+    )
+    # (a) Cmax=0 batch (全 discard, candidate 無し)
+    b0 = collate_decision_samples(
+        [_make_discard_sample(tile_type=5, step_id=i) for i in range(3)]
+    )
+    loss0, m0 = compute_imitation_loss(model, b0, cfg)
+    assert m0.discard_count == 3
+    assert math.isfinite(float(loss0.item()))
+    # (b) candidate sample だが candidate_count=0 (= 異なる C の mixed batch で
+    #     pad されたケースを模す: invalid selected index)
+    s_bad = _make_candidate_sample(selected_index=5, num_cands=2)  # idx>=count
+    b1 = collate_decision_samples([s_bad])
+    loss1, m1 = compute_imitation_loss(model, b1, cfg)
+    assert m1.candidate_count == 0  # invalid index は除外
+    assert math.isfinite(float(loss1.item()))
+
+
+def test_branch_local_mode_matches_legacy_hard_ce():
+    """policy_loss_mode='branch_local' で discard CE が discard_logits 単独の
+    CE と一致 (旧挙動)。"""
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_discard_sample_with_cands(
+        tile_type=5, legal_tiles=(3, 5, 7), num_cands=2
+    )
+    batch = collate_decision_samples([s])
+    cfg = ImitationConfig(
+        terminal_loss_coef=0.0, yaku_loss_coef=0.0,
+        policy_loss_mode="branch_local",
+    )
+    _, metrics = compute_imitation_loss(model, batch, cfg)
+    with torch.no_grad():
+        obs = batch.observation.float()
+        fwd = model(obs, discard_mask=batch.discard_mask.float())
+        expected = float(
+            -F.log_softmax(fwd.discard_logits, dim=-1)[0, 5].item()
+        )
+    assert metrics.discard_loss == pytest.approx(expected, abs=1e-5)
+
+
+def test_branch_local_vs_combined_differ_when_candidates_present():
+    """candidate が co-legal な discard sample では branch_local と combined で
+    discard_loss が異なる (combined は candidate mass を denominator に含む)。"""
+    torch.manual_seed(0)
+    model = _build_model()
+    s = _make_discard_sample_with_cands(
+        tile_type=5, legal_tiles=(3, 5, 7), num_cands=3
+    )
+    batch = collate_decision_samples([s])
+    base = dict(terminal_loss_coef=0.0, yaku_loss_coef=0.0)
+    _, m_bl = compute_imitation_loss(
+        model, batch, ImitationConfig(**base, policy_loss_mode="branch_local")
+    )
+    _, m_cb = compute_imitation_loss(
+        model, batch, ImitationConfig(**base, policy_loss_mode="combined")
+    )
+    # combined は candidate も denominator に入るので >= branch_local
+    assert m_cb.discard_loss >= m_bl.discard_loss
+    assert not math.isclose(
+        m_cb.discard_loss, m_bl.discard_loss, abs_tol=1e-9
+    )
+
+
+def test_imitation_policy_loss_mode_invalid_raises():
+    """typo な policy_loss_mode は silent fallback せず ValueError。"""
+    model = _build_model()
+    batch = collate_decision_samples(
+        [_make_discard_sample(tile_type=5, step_id=0)]
+    )
+    cfg = ImitationConfig(policy_loss_mode="combinned")
+    with pytest.raises(ValueError, match="policy_loss_mode"):
+        compute_imitation_loss(model, batch, cfg)

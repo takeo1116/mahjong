@@ -111,6 +111,22 @@ class ImitationConfig:
     False (default) のとき:
       - 全 discard sample で hard top1 CE。Stage03 v1 互換。
     """
+    # policy loss mode
+    policy_loss_mode: str = "combined"
+    """discard / candidate policy CE を計算する logits 空間。
+
+    - ``"combined"`` (default): Stage03 の実 action distribution に合わせ、
+      ``concat(masked_discard_logits[34], masked_candidate_scores[Cmax])`` の
+      combined softmax 上で teacher action の log-prob を最大化する。
+      discard sample では candidate actions も denominator に入るため、
+      teacher=normal_discard の局面で model が riichi_discard / kakan / ankan に
+      確率を置くと loss が増える (= ModelPolicyAgent / PPO の combined 分布と整合)。
+    - ``"branch_local"``: 旧挙動。discard は discard_logits[34] のみ、candidate は
+      candidate_scores[Cmax] のみで CE。ablation / 互換用。
+
+    accuracy 系 (accuracy_discard / accuracy_candidate) は両 mode とも branch-local
+    診断のまま (discard 部分 / candidate 部分の argmax)。
+    """
 
 
 @dataclass(frozen=True)
@@ -189,6 +205,7 @@ class ImitationMetrics:
 
 _NORMAL_DISCARD_FAMILY: str = ActionFamily.NORMAL_DISCARD.value
 _LARGE_NEG: float = -1.0e9
+_NUM_TILE_TYPES: int = 34
 
 
 def _zero_loss(device: torch.device) -> torch.Tensor:
@@ -314,6 +331,37 @@ def compute_imitation_loss(
     cand_out = model.score_candidates(obs, cand_feat)
     cand_scores = cand_out.candidate_scores  # (B, Cmax)
 
+    # ---- combined policy distribution ----
+    # ``policy_loss_mode == "combined"`` のとき、discard / candidate CE は
+    # ``concat(masked_discard_logits[34], masked_candidate_scores[Cmax])`` の
+    # combined softmax 上で取る (= ModelPolicyAgent / PPO と同じ分布)。
+    # ``fwd.discard_logits`` は model 側で discard_mask 済み (illegal = -1e9)。
+    # typo を silent に branch_local へ倒さないよう fail-fast で validate する。
+    mode = str(config.policy_loss_mode)
+    if mode not in {"combined", "branch_local"}:
+        raise ValueError(
+            "ImitationConfig.policy_loss_mode must be 'combined' or "
+            f"'branch_local', got {config.policy_loss_mode!r}"
+        )
+    combined_mode = mode == "combined"
+    cmax_full = int(cand_scores.size(1))
+    if combined_mode:
+        if cmax_full > 0:
+            masked_cand_all = cand_scores + (1.0 - cand_mask) * _LARGE_NEG
+        else:
+            masked_cand_all = cand_scores  # (B, 0)
+        combined_logits_all = torch.cat(
+            [fwd.discard_logits, masked_cand_all], dim=-1
+        )  # (B, 34 + Cmax)
+        combined_lsm_all = F.log_softmax(combined_logits_all, dim=-1)
+        # discard / candidate 各部分の log-prob (combined 分布内での値)。
+        discard_logp_all = combined_lsm_all[:, :_NUM_TILE_TYPES]  # (B, 34)
+        candidate_logp_all = combined_lsm_all[:, _NUM_TILE_TYPES:]  # (B, Cmax)
+    else:
+        combined_lsm_all = None
+        discard_logp_all = None
+        candidate_logp_all = None
+
     # ---- discard branch ----
     is_normal_discard = torch.tensor(
         [fam == _NORMAL_DISCARD_FAMILY for fam in batch.decision_family],
@@ -335,23 +383,26 @@ def compute_imitation_loss(
         d_logits = fwd.discard_logits[discard_valid_idx]
         d_targets = sel_disc[discard_valid_idx]
         d_weights = sample_weight[discard_valid_idx]
+        # discard CE に使う log-prob。combined mode では combined 分布内の
+        # discard 部分 log-prob (= candidate も denominator に含む)。
+        # branch_local mode では discard_logits 単独の log_softmax。
+        if combined_mode:
+            d_logp = discard_logp_all[discard_valid_idx]  # (M, 34)
+        else:
+            d_logp = F.log_softmax(d_logits, dim=-1)  # (M, 34)
         if config.tie_aware_discard:
             d_masks = teacher_best_mask[discard_valid_idx]  # (M, 34)
             has_best = d_masks.sum(dim=-1) > 0  # (M,) bool
-            # mask の中で hot な index を target に使うため、softmax 後の
-            # 確率を合計して -log を取る。
-            log_softmax = F.log_softmax(d_logits, dim=-1)  # (M, 34)
             losses = torch.zeros(
                 d_logits.size(0), device=d_logits.device, dtype=d_logits.dtype
             )
             # mask あり: tie-aware soft target
+            # log_sum_exp over hot indices = log(sum p_i)。combined mode では
+            # p_i は combined 分布上の確率なので、candidate mass も自動的に
+            # denominator に入る。mask=0 の位置を -inf に倒して logsumexp する。
             if bool(has_best.any().item()):
-                # log_sum_exp over hot indices = log(sum p_i)
-                #   = log( sum exp(log_softmax) where mask=1 )
-                # mask=0 の位置を -inf に倒して logsumexp する。
-                logp = log_softmax[has_best]
+                logp = d_logp[has_best]
                 m = d_masks[has_best]
-                # 0 の位置を -inf 相当に
                 neg_inf = torch.full_like(logp, -1.0e9)
                 masked_logp = torch.where(m > 0, logp, neg_inf)
                 tie_loss = -torch.logsumexp(masked_logp, dim=-1)
@@ -360,9 +411,9 @@ def compute_imitation_loss(
             if bool((~has_best).any().item()):
                 idx_hard = (~has_best).nonzero(as_tuple=False).flatten()
                 tgts_hard = d_targets[idx_hard]
-                hard_loss = F.cross_entropy(
-                    d_logits[idx_hard], tgts_hard, reduction="none"
-                )
+                hard_loss = -d_logp[idx_hard].gather(
+                    1, tgts_hard.unsqueeze(1)
+                ).squeeze(1)
                 losses[idx_hard] = hard_loss
             if use_weighting:
                 discard_loss = _weighted_mean(losses, d_weights)
@@ -372,6 +423,8 @@ def compute_imitation_loss(
                 # tie-aware accuracy: best_mask を持つ sample では
                 # argmax が best_set 内のどれかに当たれば correct、
                 # mask 無し sample は hard top1 一致で correct (= loss semantics と整合)。
+                # argmax は discard 部分 (masked discard logits) で取る
+                # (= 両 mode で同一の branch-local 診断)。
                 argmax_idx = d_logits.argmax(dim=-1)  # (M,)
                 correct = torch.zeros(
                     argmax_idx.size(0),
@@ -388,7 +441,9 @@ def compute_imitation_loss(
                     correct |= ((~has_best) & (argmax_idx == d_targets))
                 discard_correct = int(correct.sum().item())
         else:
-            per_sample = F.cross_entropy(d_logits, d_targets, reduction="none")
+            per_sample = -d_logp.gather(
+                1, d_targets.unsqueeze(1)
+            ).squeeze(1)
             if use_weighting:
                 discard_loss = _weighted_mean(per_sample, d_weights)
             else:
@@ -421,7 +476,16 @@ def compute_imitation_loss(
             cmask = cand_mask[candidate_valid_idx]     # (M, Cmax)
             masked = scores + (1.0 - cmask) * _LARGE_NEG
             tgt = sel_cand[candidate_valid_idx]
-            per_sample_cand = F.cross_entropy(masked, tgt, reduction="none")
+            # candidate CE log-prob。combined mode では combined 分布内の
+            # candidate 部分 (= discard も denominator)。branch_local では
+            # candidate scores 単独の log_softmax。
+            if combined_mode:
+                c_logp = candidate_logp_all[candidate_valid_idx]  # (M, Cmax)
+            else:
+                c_logp = F.log_softmax(masked, dim=-1)  # (M, Cmax)
+            per_sample_cand = -c_logp.gather(
+                1, tgt.unsqueeze(1)
+            ).squeeze(1)
             if use_weighting:
                 cand_weights = sample_weight[candidate_valid_idx]
                 candidate_loss = _weighted_mean(per_sample_cand, cand_weights)

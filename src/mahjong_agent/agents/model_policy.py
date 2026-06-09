@@ -20,6 +20,7 @@ head と candidate head の両方で action を sample する agent。``log_prob
 """
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -210,7 +211,9 @@ class ModelPolicyAgent:
         d_mask = torch.from_numpy(
             self._encoder.discard_legal_mask(legal_set)
         ).to(device).float().unsqueeze(0)
-        cand_feat_np = self._encoder.encode_candidates(legal_set)
+        cand_feat_np = self._encoder.encode_candidates(
+            legal_set, observation_feat=obs_feat_np,
+        )
         cand_count = int(cand_feat_np.shape[0])
         cand_feat = torch.from_numpy(cand_feat_np).to(device).float().unsqueeze(0)
 
@@ -257,15 +260,37 @@ class ModelPolicyAgent:
         if self._config.greedy:
             idx = int(torch.argmax(scaled_logits).item())
         else:
-            probs = torch.exp(log_probs)
+            # sampling 用 probs は combined_mask で illegal 位置を明示 zero-out
+            # して再正規化する。softmax は -1e9 mask 済みだが、浮動小数誤差で
+            # illegal 位置に微小確率が残り、かつ legal 側の合計が 1.0 をわずかに
+            # 下回ると cumulative loop の fallback が illegal な末尾 index を
+            # 選び得る (= 旧 fallback `len(probs)-1` のバグ)。zero-out + 再正規化
+            # + fallback を legal index に限定することで illegal sampling を防ぐ。
+            probs = torch.exp(log_probs) * combined_mask  # (34 + C,)
+            probs_sum = float(probs.sum().item())
+            if not math.isfinite(probs_sum) or probs_sum <= 0.0:
+                raise ValueError(
+                    f"ModelPolicyAgent: degenerate sampling distribution "
+                    f"(masked prob sum={probs_sum}) for player "
+                    f"{legal_set.decision_player}"
+                )
+            probs = probs / probs.sum()
             # sampling は CPU 上で行って rng を使う (deterministic 化のため)。
             probs_cpu = probs.detach().cpu().numpy()
-            # numpy で sampling. rng を seed と共に使う。
+            mask_cpu = combined_mask.detach().cpu().numpy()
+            # legal かつ確率正の index のみを sampling 母集団とする。
+            valid_indices = [
+                i
+                for i in range(probs_cpu.shape[0])
+                if mask_cpu[i] > 0.0 and probs_cpu[i] > 0.0
+            ]
+            # probs_sum > 0 を上で確認済みなので valid_indices は非空。
+            # fallback は **legal な最後の index** (= 旧 `len(probs)-1` を是正)。
+            idx = valid_indices[-1]
             r = rng.random()
             cum = 0.0
-            idx = int(probs_cpu.shape[0]) - 1
-            for i, p in enumerate(probs_cpu):
-                cum += float(p)
+            for i in valid_indices:
+                cum += float(probs_cpu[i])
                 if r <= cum:
                     idx = i
                     break

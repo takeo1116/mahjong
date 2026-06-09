@@ -20,16 +20,20 @@ ukeire 最大化の通常打牌と、shape ベース heuristic 系統の副露�
 -------------------------------------------------
 1. **Tsumo / Ron**: candidate に win action があれば必ず選ぶ。
 2. **KyushuKyuhai**: 取れるなら取る。
-3. **Normal discard**: shanten 最小化 + ukeire 最大化で 1 つ選ぶ。
+3. **RiichiDiscard** (``prefer_riichi=True``, default): 立直できる局面なら
+   基本立直する (Stage02 parity)。NORMAL_DISCARD より優先。打牌 tile は
+   shanten 最小 + ukeire 最大の best set 内から選ぶ (hand_counts 不可なら
+   tile_type 昇順先頭)。``prefer_riichi=False`` ではこの step を skip。
+4. **Normal discard**: shanten 最小化 + ukeire 最大化で 1 つ選ぶ。
    observation 無し / 計算失敗時は legacy fallback (= 最大 tile_type)。
-4. **RiichiDiscard**: 通常打牌が無く RiichiDiscard だけが残っている例外
-   ケースで、tile_type 昇順の先頭を選ぶ。通常時はリーチを自動で打たない。
-5. **副露評価**: ``RuleBasedCallPolicy`` で CHI / PON / DAIMINKAN を採点。
+5. **RiichiDiscard fallback**: 通常打牌が無く RiichiDiscard だけが残る例外
+   ケース (``prefer_riichi`` に関わらず) で立直打牌を選ぶ。
+6. **副露評価**: ``RuleBasedCallPolicy`` で CHI / PON / DAIMINKAN を採点。
    PASS が最高 score なら PASS。
-6. **Pass** (= response phase で call score 0 のとき)。
-7. **Kita** (3P): 取れるなら取る。
-8. **Ankan / Kakan**: 他に取れる option が無いときの fallback。
-9. **Chi / Pon / Daiminkan**: 同上の fallback。
+7. **Pass** (= response phase で call score 0 のとき)。
+8. **Kita** (3P): 取れるなら取る。
+9. **Ankan / Kakan**: 他に取れる option が無いときの fallback。
+10. **Chi / Pon / Daiminkan**: 同上の fallback。
 """
 from __future__ import annotations
 
@@ -76,6 +80,12 @@ class RuleBasedBaselineAgent:
     use_shanten_discard:
         ``True`` (default) で shanten 最小化 + ukeire 最大化の通常打牌。
         ``False`` で legacy "最大 tile_type" fallback。
+    prefer_riichi:
+        ``True`` (default) で「立直できる局面なら基本的に立直する」挙動
+        (Stage02 parity)。``RIICHI_DISCARD`` が legal なら ``NORMAL_DISCARD``
+        より優先して選ぶ。``False`` で旧挙動 (通常打牌優先、立直は normal
+        discard が無い例外時のみ)。eval opponent の強度を Stage02 に揃える
+        ための flag。
     """
 
     def __init__(
@@ -84,10 +94,12 @@ class RuleBasedBaselineAgent:
         *,
         use_call_policy: bool = True,
         use_shanten_discard: bool = True,
+        prefer_riichi: bool = True,
     ) -> None:
         self._rng = random.Random(seed)
         self._use_call_policy = bool(use_call_policy)
         self._use_shanten_discard = bool(use_shanten_discard)
+        self._prefer_riichi = bool(prefer_riichi)
         self._call_policy = RuleBasedCallPolicy()
 
     # ------------------------------------------------------------------
@@ -129,16 +141,23 @@ class RuleBasedBaselineAgent:
                 rationale="kyushu_kyuhai",
             )
 
+        # 2.5) RiichiDiscard (prefer_riichi=True): 立直できるなら基本立直する
+        # (Stage02 parity)。NORMAL_DISCARD より優先。
+        if self._prefer_riichi and ActionFamily.RIICHI_DISCARD in cand_by_family:
+            return self._decide_riichi_discard(
+                cand_by_family[ActionFamily.RIICHI_DISCARD], observation
+            )
+
         # 3) Normal discard
         if legal_set.normal_discard:
             return self._decide_normal_discard(legal_set, observation)
 
-        # 4) RiichiDiscard fallback
+        # 4) RiichiDiscard fallback (prefer_riichi=False + 通常打牌が無い例外、
+        # または prefer_riichi=True でも normal_discard が空のケース)。
         if ActionFamily.RIICHI_DISCARD in cand_by_family:
-            chosen = self._pick_riichi_discard(
-                cand_by_family[ActionFamily.RIICHI_DISCARD]
+            return self._decide_riichi_discard(
+                cand_by_family[ActionFamily.RIICHI_DISCARD], observation
             )
-            return AgentDecision(action=chosen, rationale="riichi_discard_fallback")
 
         # 5) Response (call policy)
         if self._use_call_policy and any(
@@ -243,6 +262,65 @@ class RuleBasedBaselineAgent:
                 "teacher_shanten": int(result.best_shanten),
                 "teacher_ukeire": int(result.best_acceptance),
             },
+        )
+
+    # ------------------------------------------------------------------
+    # riichi discard branch
+    # ------------------------------------------------------------------
+
+    def _decide_riichi_discard(
+        self,
+        riichi_cands: list[ModelAction],
+        observation: Any | None,
+    ) -> AgentDecision:
+        """``RIICHI_DISCARD`` candidate から打牌 tile を deterministic に選ぶ。
+
+        observation から hand_counts が取れる場合は、立直可能 tile (= riichi
+        candidate の tile_type) を legal mask として ``find_best_discard`` を
+        呼び、shanten 最小 + ukeire 最大の tile を選ぶ (best set 内)。teacher
+        情報も extras に入れる。hand_counts 不可 / 照合不能なら tile_type 昇順
+        先頭の deterministic fallback (``_pick_riichi_discard``)。
+        """
+        # tile_type -> riichi candidate (同 tile_type は先頭を採用、deterministic)
+        by_tt: dict[int, ModelAction] = {}
+        for c in sorted(
+            riichi_cands,
+            key=lambda c: (c.key.tile_type if c.key.tile_type is not None else -1),
+        ):
+            tt = c.key.tile_type
+            if tt is not None and 0 <= int(tt) < _NUM_TILE_TYPES and tt not in by_tt:
+                by_tt[int(tt)] = c
+
+        hand_counts = (
+            extract_hand_counts(observation)
+            if self._use_shanten_discard
+            else None
+        )
+        if hand_counts is not None and by_tt:
+            legal_mask = np.zeros(_NUM_TILE_TYPES, dtype=np.float32)
+            for tt in by_tt:
+                legal_mask[tt] = 1.0
+            meld_count = extract_own_meld_count(observation)
+            result = find_best_discard(
+                hand_counts, legal_mask, meld_count=meld_count
+            )
+            if result.best_tile_type in by_tt:
+                chosen_tt = int(result.best_tile_type)
+                return AgentDecision(
+                    action=by_tt[chosen_tt],
+                    rationale="riichi_discard:shanten_min",
+                    extras={
+                        "teacher_best_mask": result.best_mask,
+                        "teacher_discard_tile_type": chosen_tt,
+                        "teacher_shanten": int(result.best_shanten),
+                        "teacher_ukeire": int(result.best_acceptance),
+                    },
+                )
+
+        # fallback: tile_type 昇順先頭 (deterministic)
+        chosen = self._pick_riichi_discard(riichi_cands)
+        return AgentDecision(
+            action=chosen, rationale="riichi_discard:fallback"
         )
 
     # ------------------------------------------------------------------

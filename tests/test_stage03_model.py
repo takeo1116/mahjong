@@ -386,6 +386,10 @@ def test_direct_hint_from_encoder_metadata_picks_per_tile_ranges():
     names = [n for n, _s, _e in cfg.direct_hint_ranges]
     assert "shanten_delta_per_discard" in names
     assert "discard_ukeire_per_tile" in names
+    # defensive direct hints (ISSUE-0022) も default で含まれる
+    assert "safe_vs_all_riichi_mask" in names
+    assert "suji_vs_all_riichi_mask" in names
+    assert "kabe_suji_mask" in names
     for _n, s, e in cfg.direct_hint_ranges:
         assert e - s == 34
 

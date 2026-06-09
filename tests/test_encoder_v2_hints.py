@@ -18,9 +18,9 @@ def test_encoder_default_enables_hints():
     assert enc.enable_hints is True
     meta = enc.metadata()
     assert meta.observation_dim > 363
-    # 363 + hint dims (1 + 34 + 34 + 1 + 1 + 6 + shape_hint 66) = 506
-    # (旧仕様にあった riichi_discard_mask=34 は削除済み、shape_hint 66 を追加)
-    assert meta.observation_dim == 506
+    # 506 (= 363 base + 旧 hints + shape_hint 66) + defensive direct hints
+    # (safe 34 + suji 34 + kabe 34 = 102) = 608
+    assert meta.observation_dim == 608
 
 
 def test_encoder_with_hints_disabled_returns_legacy_dim():
@@ -41,14 +41,38 @@ def test_encoder_feature_ranges_include_new_hints():
         "turn_progress_norm",
         "tile_presence_flags",
         "shape_hint",
+        "safe_vs_all_riichi_mask",
+        "suji_vs_all_riichi_mask",
+        "kabe_suji_mask",
     }
     assert expected_hint_names <= set(ranges.keys())
     # shape_hint は 66 dim
     s, e = ranges["shape_hint"]
     assert e - s == 66
+    # defensive direct hints は各 34 dim
+    for name in (
+        "safe_vs_all_riichi_mask",
+        "suji_vs_all_riichi_mask",
+        "kabe_suji_mask",
+    ):
+        s, e = ranges[name]
+        assert e - s == 34
     # contiguous な layout (= 全 range の合計 = observation_dim)
     total = sum(e - s for s, e in ranges.values())
     assert total == enc.metadata().observation_dim
+
+
+def test_encoder_defensive_hints_appended_after_existing_hints():
+    """3 defensive feature は hint 末尾 append で、既存 range が動いていない。"""
+    enc = PublicObservationEncoder(enable_hints=True)
+    ranges = enc.metadata().feature_ranges
+    # 既存 shape_hint の直後から defensive が始まる (末尾 append)
+    assert ranges["safe_vs_all_riichi_mask"][0] == ranges["shape_hint"][1]
+    assert ranges["suji_vs_all_riichi_mask"][0] == ranges["safe_vs_all_riichi_mask"][1]
+    assert ranges["kabe_suji_mask"][0] == ranges["suji_vs_all_riichi_mask"][1]
+    assert ranges["kabe_suji_mask"][1] == enc.metadata().observation_dim
+    # 既存 base feature の range は不変 (先頭 self_hand_counts は 0..34)
+    assert ranges["self_hand_counts"] == (0, 34)
 
 
 def test_encoder_feature_ranges_no_longer_include_riichi_discard_mask():
@@ -71,6 +95,9 @@ def test_encoder_legacy_off_omits_hint_ranges():
         "turn_progress_norm",
         "tile_presence_flags",
         "shape_hint",
+        "safe_vs_all_riichi_mask",
+        "suji_vs_all_riichi_mask",
+        "kabe_suji_mask",
     }
     assert not (hint_names & set(ranges.keys()))
 
@@ -349,3 +376,138 @@ def test_no_legacy_363_hardcode_in_source():
                     continue
                 bad_hits.append((str(path), i, line))
     assert not bad_hits, f"363 hard-codes found: {bad_hits}"
+
+
+# ----------------------------------------------------------------------
+# defensive direct hints (ISSUE-0022): semantics
+# ----------------------------------------------------------------------
+
+from mahjong_agent.encoders.public_observation import (  # noqa: E402
+    _compute_kabe_suji_mask,
+    _compute_riichi_safe_masks,
+)
+
+
+def _ids(tile_types):
+    """tile_type list -> tile_id list (各 type の代表 id = type*4)。"""
+    return [int(tt) * 4 for tt in tile_types]
+
+
+class _DefenseObs:
+    """守備 feature 用の薄い observation stub。"""
+
+    def __init__(self, discards, riichi_declared, hand=None, melds=None,
+                 dora=None, player_id=0):
+        self.discards = discards
+        self.riichi_declared = riichi_declared
+        self.hand = hand or []
+        self.melds = melds or [[], [], [], []]
+        self.dora_indicators = dora or []
+        self.player_id = player_id
+
+
+def test_defense_no_active_riichi_is_all_zero():
+    o = _DefenseObs([[], [], [], []], [False, False, False, False])
+    safe, suji = _compute_riichi_safe_masks(o, 0, 4)
+    assert float(safe.sum()) == 0.0
+    assert float(suji.sum()) == 0.0
+
+
+def test_defense_genbutsu_from_opp_river():
+    # opp seat1 riichi, 河に 5m(tt=4) -> safe[4]==1
+    o = _DefenseObs([[], _ids([4]), [], []], [False, True, False, False])
+    safe, _ = _compute_riichi_safe_masks(o, 0, 4)
+    assert safe[4] == 1.0
+
+
+def test_defense_outer_suji_from_center_safe():
+    # opp safe に 4m(tt=3) -> suji 1m(0), 7m(6)
+    o = _DefenseObs([[], _ids([3]), [], []], [False, True, False, False])
+    _, suji = _compute_riichi_safe_masks(o, 0, 4)
+    assert suji[0] == 1.0
+    assert suji[6] == 1.0
+
+
+def test_defense_single_suji_not_adopted():
+    # 1m(0) だけ safe で 7m が safe でない -> suji[4m]==0 (片スジ不採用)
+    o = _DefenseObs([[], _ids([0]), [], []], [False, True, False, False])
+    _, suji = _compute_riichi_safe_masks(o, 0, 4)
+    assert suji[3] == 0.0
+
+
+def test_defense_naka_suji_both_outers_safe():
+    # 1m(0) と 7m(6) が両方 safe -> suji[4m]==1 (中筋)
+    o = _DefenseObs([[], _ids([0, 6]), [], []], [False, True, False, False])
+    _, suji = _compute_riichi_safe_masks(o, 0, 4)
+    assert suji[3] == 1.0
+
+
+def test_defense_multi_riichi_uses_and():
+    # opp1(seat1) 河に 5m、opp2(seat2) 河に 1m。5m は opp2 に対して safe でない
+    # -> AND なので safe[5m]==0
+    o = _DefenseObs(
+        [[], _ids([4]), _ids([0]), []], [False, True, True, False]
+    )
+    safe, _ = _compute_riichi_safe_masks(o, 0, 4)
+    assert safe[4] == 0.0
+    # 共通して safe な牌種は無い
+    assert float(safe.sum()) == 0.0
+
+
+def test_defense_self_riichi_not_counted_as_opponent():
+    # 自分(player_id=0)が riichi でも、自分は active riichi opponent ではない
+    o = _DefenseObs([_ids([4]), [], [], []], [True, False, False, False])
+    safe, suji = _compute_riichi_safe_masks(o, 0, 4)
+    assert float(safe.sum()) == 0.0
+    assert float(suji.sum()) == 0.0
+
+
+def test_kabe_center_wall_outer_suji():
+    # visible 4m(tt=3) が4枚 (手牌に4枚) -> kabe[1m]==1, [7m]==1
+    o = _DefenseObs([[], [], [], []], [False, False, False, False],
+                    hand=_ids([3, 3, 3, 3]))
+    k = _compute_kabe_suji_mask(o, 4)
+    assert k[0] == 1.0
+    assert k[6] == 1.0
+
+
+def test_kabe_terminal_wall_not_adopted():
+    # visible 1m(tt=0) が4枚 -> kabe[4m]==0 (端牌壁からの片側筋は不採用)
+    o = _DefenseObs([[], [], [], []], [False, False, False, False],
+                    hand=_ids([0, 0, 0, 0]))
+    k = _compute_kabe_suji_mask(o, 4)
+    assert k[3] == 0.0
+
+
+def test_kabe_visible_counts_aggregate_sources():
+    # 4m を 手牌2 + 河1 + ドラ表示1 = 4枚見え -> kabe[1m]==1
+    o = _DefenseObs(
+        discards=[_ids([3]), [], [], []],
+        riichi_declared=[False, False, False, False],
+        hand=_ids([3, 3]),
+        dora=_ids([3]),
+    )
+    k = _compute_kabe_suji_mask(o, 4)
+    assert k[0] == 1.0
+    assert k[6] == 1.0
+
+
+def test_encoder_integration_defensive_masks_written():
+    """encoder 経由で defensive feature が range に正しく書かれる (integration)。"""
+    enc = PublicObservationEncoder(enable_hints=True)
+    ranges = enc.metadata().feature_ranges
+    # seat1 riichi、河に 5m(tt=4)。自手は適当な 13 枚。
+    obs = _FakeObs(hand=_ids([0, 1, 2, 9, 10, 11, 18, 19, 20, 27, 27, 28, 28]))
+    obs.discards = [[], _ids([4, 3]), [], []]
+    obs.riichi_declared = [False, True, False, False]
+    feat = enc.encode_observation(obs)
+    s, e = ranges["safe_vs_all_riichi_mask"]
+    safe = feat[s:e]
+    # 5m(4) と 4m(3) は opp 河の現物 -> safe
+    assert safe[4] == 1.0
+    assert safe[3] == 1.0
+    s, e = ranges["suji_vs_all_riichi_mask"]
+    suji = feat[s:e]
+    # 4m(3) が safe -> 1m(0),7m(6) は suji
+    assert suji[0] == 1.0
+    assert suji[6] == 1.0

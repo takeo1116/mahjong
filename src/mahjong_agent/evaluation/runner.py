@@ -565,7 +565,11 @@ class SelfPlayRunner:
             obs, extras
         )
         discard_mask = self.encoder.discard_legal_mask(legal_set)
-        cand_feat = self.encoder.encode_candidates(legal_set)
+        # observation_feat を渡して candidate safety scalar を埋める
+        # (再 encode せず candidate に action-local hint を反映)。
+        cand_feat = self.encoder.encode_candidates(
+            legal_set, observation_feat=observation_feat
+        )
         family = decision_action.family
         if family == ActionFamily.NORMAL_DISCARD:
             sel_tt = int(decision_action.tile_type)

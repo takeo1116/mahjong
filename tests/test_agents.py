@@ -208,25 +208,106 @@ def test_rule_based_normal_discard_picks_highest_tile_type():
     assert dec.tile_type == 31
 
 
-def test_rule_based_prefers_normal_discard_over_riichi_discard():
-    """通常打牌が legal なら自動でリーチを打たない。"""
-    agent = RuleBasedBaselineAgent()
+def test_rule_based_prefers_riichi_discard_by_default():
+    """prefer_riichi=True (default) で立直できる局面は RIICHI_DISCARD を優先。"""
+    agent = RuleBasedBaselineAgent()  # default prefer_riichi=True
+    cands = [_candidate(ActionFamily.RIICHI_DISCARD, tile_type=3)]
+    lset = _make_set(normal_tts=[1, 2, 3], candidates=cands)
+    dec = agent.select_action(lset)
+    assert dec.family == ActionFamily.RIICHI_DISCARD
+    assert dec.tile_type == 3
+
+
+def test_rule_based_prefer_riichi_off_keeps_normal_discard():
+    """prefer_riichi=False で従来通り通常打牌を優先 (自動立直しない)。"""
+    agent = RuleBasedBaselineAgent(prefer_riichi=False)
     cands = [_candidate(ActionFamily.RIICHI_DISCARD, tile_type=3)]
     lset = _make_set(normal_tts=[1, 2, 3], candidates=cands)
     dec = agent.select_action(lset)
     assert dec.family == ActionFamily.NORMAL_DISCARD
 
 
-def test_rule_based_riichi_discard_fallback_when_no_normal_discard():
+def test_rule_based_riichi_discard_deterministic_tile_choice():
+    """複数 RIICHI_DISCARD candidate (observation 無し) で deterministic に
+    tile_type 昇順先頭を選ぶ。"""
     agent = RuleBasedBaselineAgent()
     cands = [
         _candidate(ActionFamily.RIICHI_DISCARD, tile_type=8),
         _candidate(ActionFamily.RIICHI_DISCARD, tile_type=3),
     ]
-    lset = _make_set(candidates=cands)
-    dec = agent.select_action(lset)
+    lset = _make_set(normal_tts=[3, 8], candidates=cands)
+    decs = [agent.select_action(lset) for _ in range(5)]
+    for dec in decs:
+        assert dec.family == ActionFamily.RIICHI_DISCARD
+        assert dec.tile_type == 3  # tile_type 昇順の先頭、deterministic
+
+
+def test_rule_based_riichi_discard_fallback_when_no_normal_discard():
+    """通常打牌が無く RIICHI_DISCARD だけ残る例外ケース (prefer_riichi に
+    関わらず立直打牌を選ぶ)。"""
+    for prefer in (True, False):
+        agent = RuleBasedBaselineAgent(prefer_riichi=prefer)
+        cands = [
+            _candidate(ActionFamily.RIICHI_DISCARD, tile_type=8),
+            _candidate(ActionFamily.RIICHI_DISCARD, tile_type=3),
+        ]
+        lset = _make_set(candidates=cands)
+        dec = agent.select_action(lset)
+        assert dec.family == ActionFamily.RIICHI_DISCARD
+        assert dec.tile_type == 3  # tile_type 昇順の先頭
+
+
+class _RiichiFakeObs:
+    """riichi discard tile choice 用の薄い observation stub。"""
+
+    def __init__(self, hand: list[int], player_id: int = 0):
+        self.hand = hand
+        self.player_id = player_id
+        self.melds = [[], [], [], []]
+
+
+def test_rule_based_riichi_discard_uses_shanten_best_set_with_obs():
+    """observation/hand_counts が使えるとき、riichi discard tile は
+    shanten 最小 + ukeire 最大の best set 内から選ばれ teacher 情報が入る。"""
+    import numpy as np
+
+    from mahjong_agent.baseline.discard_select import find_best_discard
+
+    # tenpai 形: 123m 456m 789m 22p + 5p (14 枚)。5p を切れば 22p 雀頭 +
+    # 123/456/789m 三面子 = 22p 単騎 tenpai。2p を 1 枚切っても tenpai 形が
+    # 変わる。riichi candidate は手牌にある tile_type のうち複数用意する。
+    hand = (
+        [0, 1, 2]      # 1m2m3m (tile_type 0,1,2)
+        + [12, 16, 20]  # 4m5m6m -> tile_type 3,4,5? いや tile_id//4
+        + [24, 28, 32]  # 7m8m9m
+        + [40, 41]      # 2p (tile_type 10) x2
+        + [52]          # 5p (tile_type 13)
+    )
+    obs = _RiichiFakeObs(hand=hand)
+    # riichi candidate を tile_type 13 (5p) と 10 (2p) で用意
+    cands = [
+        _candidate(ActionFamily.RIICHI_DISCARD, tile_type=10),
+        _candidate(ActionFamily.RIICHI_DISCARD, tile_type=13),
+    ]
+    lset = _make_set(normal_tts=[10, 13], candidates=cands)
+    agent = RuleBasedBaselineAgent()  # prefer_riichi=True
+    dec = agent.select_action(lset, observation=obs)
     assert dec.family == ActionFamily.RIICHI_DISCARD
-    assert dec.tile_type == 3  # tile_type 昇順の先頭
+    assert "teacher_best_mask" in dec.extras
+    assert "teacher_discard_tile_type" in dec.extras
+    assert "teacher_shanten" in dec.extras
+    assert "teacher_ukeire" in dec.extras
+    # 選んだ tile は riichi candidate の tile_type のいずれか
+    assert dec.tile_type in {10, 13}
+    # teacher_discard_tile_type は best_mask 内 (find_best_discard と整合)
+    from mahjong_agent.baseline.call_policy import extract_hand_counts
+
+    hc = extract_hand_counts(obs)
+    legal_mask = np.zeros(34, dtype=np.float32)
+    legal_mask[10] = 1.0
+    legal_mask[13] = 1.0
+    expected = find_best_discard(hc, legal_mask, meld_count=0)
+    assert dec.tile_type == expected.best_tile_type
 
 
 def test_rule_based_passes_on_response():

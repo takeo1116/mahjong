@@ -185,8 +185,8 @@ def test_encoder_dim_with_shape_hint():
     )
 
     enc = PublicObservationEncoder(enable_hints=True)
-    # 440 (旧 hints) + shape_hint 66 = 506
-    assert enc.metadata().observation_dim == 506
+    # 506 (shape_hint まで) + defensive direct hints (safe/suji/kabe 各 34) = 608
+    assert enc.metadata().observation_dim == 608
     enc_off = PublicObservationEncoder(enable_hints=False)
     assert enc_off.metadata().observation_dim == 363
 
