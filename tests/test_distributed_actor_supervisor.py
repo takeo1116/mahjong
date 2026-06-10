@@ -114,6 +114,26 @@ def test_worker_id_numbering():
     assert safe_worker_id("host/w012") == "host_w012"
 
 
+def test_worker_loop_pins_torch_to_single_thread(tmp_path: Path, monkeypatch):
+    import torch
+
+    from mahjong_agent.distributed import actor_supervisor as asup
+
+    # once-per-process フラグを reset して、両 API が確実に呼ばれるようにする。
+    monkeypatch.setattr(asup, "_INTEROP_THREADS_PINNED", False)
+    calls = {"intra": [], "interop": []}
+    monkeypatch.setattr(torch, "set_num_threads", lambda n: calls["intra"].append(n))
+    monkeypatch.setattr(
+        torch, "set_num_interop_threads", lambda n: calls["interop"].append(n)
+    )
+    run_root = _init(tmp_path)
+    # 即終了する terminal phase にして、冒頭の thread 固定だけ実行させる。
+    _advance(run_root, RunPhase.IMITATION_COLLECT, RunPhase.DRAINING, RunPhase.STOPPED)
+    run_worker_loop(_sup(run_root, max_chunks=1), 0)
+    assert calls["intra"][0] == 1  # torch.set_num_threads(1)
+    assert calls["interop"][0] == 1  # torch.set_num_interop_threads(1)
+
+
 def test_derive_seed_stable_and_distinct():
     def s(**kw):
         base = dict(seed_namespace="ns", actor_id="a", wid="a/w000",

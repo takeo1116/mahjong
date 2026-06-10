@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import riichienv
+import torch
 
 from mahjong_agent.agents import (
     ModelPolicyAgent,
@@ -61,6 +62,12 @@ from mahjong_agent.evaluation import SeatAgents, SelfPlayConfig, SelfPlayRunner
 _LEAK_KEY_SUBSTRINGS = ("tehai", "hand", "wall", "win_result", "mjai")
 _MAX_STEPS_PER_GAME = 4000
 _SEED_SPACE = 1_000_000_000_000  # 10^12: chunk base seed の空間
+
+# ``torch.set_num_interop_threads`` は **process 内で 1 度だけ** しか呼べず、
+# 2 回目の呼び出しは catch 不能な hard abort になる。worker subprocess では
+# run_worker_loop は 1 回しか走らないが、test では同一 process 内で複数回呼ぶため、
+# このフラグで「1 度だけ設定」を保証する。
+_INTEROP_THREADS_PINNED = False
 
 
 def _utc_now_iso() -> str:
@@ -543,6 +550,19 @@ def _load_latest_policy(dirs: _SupDirs, hb: _Heartbeat, state_policy_version):
 
 def run_worker_loop(config: SupervisorConfig, worker_index: int) -> dict[str, Any]:
     """1 worker の常駐ループ。state に従って生成 / 待機 / 終了する。"""
+    # actor worker の PyTorch は常に single-thread に固定する（ローカル PC /
+    # cluster CPU server 共通の確定設定）。batch=1 の小型 MLP 推論では worker 内
+    # multi-thread の利点が乏しく、N worker × M threads の oversubscription が
+    # 物理コアを食い合って throughput を落とすため、process 並列に統一する。
+    global _INTEROP_THREADS_PINNED
+    torch.set_num_threads(1)
+    if not _INTEROP_THREADS_PINNED:
+        # 1 度だけ設定（2 回目は hard abort になるためフラグで防ぐ）。
+        _INTEROP_THREADS_PINNED = True
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
     dirs = _SupDirs.from_root(config.run_root)
     dirs.ensure()
     run_config = read_run_config(run_config_path(config.run_root))
